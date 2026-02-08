@@ -12,9 +12,13 @@ from modules.trader import JupiterTrader
 
 logger = logging.getLogger(__name__)
 
-BANK_PERCENT_BASE = 0.10
-BANK_PERCENT_STRONG = 0.12
-BANK_PERCENT_WEAK = 0.07
+BANK_PERCENT_BY_SCORE = {
+    10: 0.15,
+    9: 0.13,
+    8: 0.11,
+    7: 0.09,
+    6: 0.07,
+}
 MAX_POSITIONS = 5
 TRAILING_STOP_PCT = 12.0
 QUICK_EXIT_TIME_SEC = 180
@@ -175,12 +179,7 @@ class PositionManager:
         return 0.0
 
     def get_position_size_sol(self, score: int = 6) -> float:
-        if score >= 8:
-            pct = BANK_PERCENT_STRONG
-        elif score <= 6:
-            pct = BANK_PERCENT_WEAK
-        else:
-            pct = BANK_PERCENT_BASE
+        pct = BANK_PERCENT_BY_SCORE.get(score, 0.07)
         return self.bank_sol * pct
 
     async def open_position(self, signal: dict) -> Position | None:

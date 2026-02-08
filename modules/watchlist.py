@@ -19,6 +19,8 @@ WATCH_FAST_CONFIRM_PCT = 20.0
 WATCH_REJECT_DROP_PCT = -5.0
 WATCH_MAX_SLOTS = 10
 WATCH_ANTI_PEAK_PCT = 25.0
+WATCH_DOUBLE_CONFIRM_SEC = 15
+WATCH_DOUBLE_CONFIRM_MAX_DROP_PCT = 5.0
 
 
 class WatchItem:
@@ -33,6 +35,8 @@ class WatchItem:
         self.checks = 0
         self.prices: list[float] = [entry_price]
         self.status = "watching"
+        self.first_confirm_at: float = 0.0
+        self.first_confirm_price: float = 0.0
 
     @property
     def age_sec(self) -> float:
@@ -59,7 +63,7 @@ class WatchItem:
         if price > self.peak_price:
             self.peak_price = price
 
-    def is_confirmed(self) -> bool:
+    def _meets_confirm_criteria(self) -> bool:
         if self.age_sec < WATCH_MIN_OBSERVE_SEC:
             return False
         if self.change_pct >= WATCH_ANTI_PEAK_PCT:
@@ -71,6 +75,23 @@ class WatchItem:
             if self._is_growth_stable():
                 return True
         return False
+
+    def is_confirmed(self) -> bool:
+        if self.first_confirm_at == 0.0:
+            if self._meets_confirm_criteria():
+                self.first_confirm_at = time.time()
+                self.first_confirm_price = self.current_price
+            return False
+        wait = time.time() - self.first_confirm_at
+        if wait < WATCH_DOUBLE_CONFIRM_SEC:
+            return False
+        if self.first_confirm_price > 0:
+            drop_since_confirm = ((self.current_price - self.first_confirm_price) / self.first_confirm_price) * 100
+            if drop_since_confirm < -WATCH_DOUBLE_CONFIRM_MAX_DROP_PCT:
+                self.first_confirm_at = 0.0
+                self.first_confirm_price = 0.0
+                return False
+        return True
 
     def _is_growth_stable(self) -> bool:
         if len(self.prices) < 2:
