@@ -12,17 +12,21 @@ from modules.trader import JupiterTrader
 
 logger = logging.getLogger(__name__)
 
-BANK_PERCENT = 0.10
+BANK_PERCENT_BASE = 0.10
+BANK_PERCENT_STRONG = 0.12
+BANK_PERCENT_WEAK = 0.07
 MAX_POSITIONS = 5
 TRAILING_STOP_PCT = 12.0
 QUICK_EXIT_TIME_SEC = 180
 QUICK_EXIT_DROP_PCT = 20.0
+MAX_LOSS_PCT = 30.0
 DEAD_TOKEN_TIME_SEC = 300
 DEAD_TOKEN_MIN_CHANGE_PCT = 2.0
 PROFIT_LOCK_THRESHOLD_PCT = 30.0
 PROFIT_LOCK_STOP_PCT = 20.0
 ROCKET_THRESHOLD_PCT = 100.0
 ROCKET_SELL_FRACTION = 0.5
+SOL_PRICE_CACHE_SEC = 60
 
 
 class Position:
@@ -76,15 +80,22 @@ class Position:
             return True
         return False
 
+    def should_max_loss_exit(self) -> bool:
+        if self.pnl_pct <= -MAX_LOSS_PCT:
+            return True
+        return False
+
     def should_trailing_stop(self) -> bool:
         if self.peak_pnl_pct < 5:
             return False
         drop_from_peak = self.peak_pnl_pct - self.pnl_pct
         stop = self.trailing_stop_pct
         if self.profit_locked:
-            stop = TRAILING_STOP_PCT * 0.6
+            stop = TRAILING_STOP_PCT * 0.5
         elif self.peak_pnl_pct >= 20:
-            stop = TRAILING_STOP_PCT * 0.8
+            stop = TRAILING_STOP_PCT * 0.75
+        if self.score >= 8:
+            stop *= 1.15
         if drop_from_peak >= stop:
             return True
         return False
@@ -163,8 +174,14 @@ class PositionManager:
             logger.error("Price fetch error for %s: %s", address[:12], e)
         return 0.0
 
-    def get_position_size_sol(self) -> float:
-        return self.bank_sol * BANK_PERCENT
+    def get_position_size_sol(self, score: int = 6) -> float:
+        if score >= 8:
+            pct = BANK_PERCENT_STRONG
+        elif score <= 6:
+            pct = BANK_PERCENT_WEAK
+        else:
+            pct = BANK_PERCENT_BASE
+        return self.bank_sol * pct
 
     async def open_position(self, signal: dict) -> Position | None:
         if len(self.positions) >= MAX_POSITIONS:
@@ -179,7 +196,7 @@ class PositionManager:
             logger.info("Already have position in %s", symbol)
             return None
 
-        sol_amount = self.get_position_size_sol()
+        sol_amount = self.get_position_size_sol(signal["total_score"])
         if sol_amount < 0.001:
             logger.warning("Position size too small: %.4f SOL", sol_amount)
             return None
@@ -200,6 +217,8 @@ class PositionManager:
         if not result:
             logger.warning("Failed to buy %s", symbol)
             return None
+
+        self.bank_sol -= sol_amount
 
         pos = Position(
             token_mint=address,
@@ -295,9 +314,12 @@ class PositionManager:
                 await self.close_position(address, "quick_exit_dump")
                 continue
 
+            if pos.should_max_loss_exit():
+                await self.close_position(address, "max_loss")
+                continue
+
             if pos.should_profit_lock():
                 pos.profit_locked = True
-                pos.trailing_stop_pct = TRAILING_STOP_PCT * 0.7
                 logger.info(
                     "PROFIT LOCKED %s: pnl=%.1f%%, tighter stop",
                     pos.symbol,
@@ -322,14 +344,22 @@ class PositionManager:
 
     async def _get_sol_price(self) -> float:
         import httpx
+        now = time.time()
+        if hasattr(self, '_sol_price_cache') and now - self._sol_price_ts < SOL_PRICE_CACHE_SEC:
+            return self._sol_price_cache
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
                     "https://api.coingecko.com/api/v3/simple/price",
                     params={"ids": "solana", "vs_currencies": "usd"},
                 )
-                return resp.json().get("solana", {}).get("usd", 200.0)
+                price = resp.json().get("solana", {}).get("usd", 200.0)
+                self._sol_price_cache = price
+                self._sol_price_ts = now
+                return price
         except Exception:
+            if hasattr(self, '_sol_price_cache'):
+                return self._sol_price_cache
             return 200.0
 
     def get_stats(self) -> dict:

@@ -63,7 +63,7 @@ async def scan_and_score() -> list[dict]:
 
         onchain_score = compute_onchain_score(token)
 
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(0.8)
         social_data = await search_token_mentions(symbol)
         social_score = compute_social_score(social_data)
 
