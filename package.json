@@ -1,0 +1,28 @@
+{
+  "name": "soso-smart-copy-trade",
+  "version": "1.0.0",
+  "description": "Smart Copy-Trade Bot for Solana — auto-discovers profitable wallets, tracks trades, and copies with intelligent filtering",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "@solana/spl-token": "^0.4.0",
+    "axios": "^1.7.0",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/node-telegram-bot-api": "^0.64.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.3.0",
+    "ts-node": "^10.9.0"
+  }
+}
