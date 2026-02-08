@@ -167,6 +167,13 @@ async def handle_commands():
                 await asyncio.sleep(5)
 
 
+async def watchlist_position_loop():
+    while True:
+        await run_watchlist_check()
+        await run_position_check()
+        await asyncio.sleep(POSITION_CHECK_INTERVAL)
+
+
 async def scheduler_loop():
     cycle = 0
     while True:
@@ -177,10 +184,7 @@ async def scheduler_loop():
         if cycle % 5 == 0:
             await run_price_update()
 
-        for _ in range(SCAN_INTERVAL_SECONDS // POSITION_CHECK_INTERVAL):
-            await run_watchlist_check()
-            await run_position_check()
-            await asyncio.sleep(POSITION_CHECK_INTERVAL)
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 
 async def main():
@@ -198,6 +202,7 @@ async def main():
 
     await asyncio.gather(
         scheduler_loop(),
+        watchlist_position_loop(),
         handle_commands(),
     )
 

@@ -18,7 +18,7 @@ WATCH_CONFIRM_GROWTH_PCT = 8.0
 WATCH_FAST_CONFIRM_PCT = 20.0
 WATCH_REJECT_DROP_PCT = -5.0
 WATCH_MAX_SLOTS = 10
-WATCH_ANTI_PEAK_PCT = 25.0
+WATCH_ANTI_PEAK_DROP_FROM_PEAK_PCT = 35.0
 WATCH_DOUBLE_CONFIRM_SEC = 15
 WATCH_DOUBLE_CONFIRM_MAX_DROP_PCT = 5.0
 
@@ -66,7 +66,7 @@ class WatchItem:
     def _meets_confirm_criteria(self) -> bool:
         if self.age_sec < WATCH_MIN_OBSERVE_SEC:
             return False
-        if self.change_pct >= WATCH_ANTI_PEAK_PCT:
+        if self._is_dumping_from_peak():
             return False
         if self.age_sec >= WATCH_MIN_TIME_SEC and self.change_pct >= WATCH_CONFIRM_GROWTH_PCT:
             if self._is_growth_stable():
@@ -93,6 +93,12 @@ class WatchItem:
                 return False
         return True
 
+    def _is_dumping_from_peak(self) -> bool:
+        if self.peak_price <= 0 or self.peak_price <= self.entry_price:
+            return False
+        drop_from_peak = ((self.peak_price - self.current_price) / self.peak_price) * 100
+        return drop_from_peak >= WATCH_ANTI_PEAK_DROP_FROM_PEAK_PCT
+
     def _is_growth_stable(self) -> bool:
         if len(self.prices) < 2:
             return True
@@ -114,7 +120,7 @@ class WatchItem:
                 return True
         if self.checks >= 2 and self.peak_change_pct > 10 and self.change_pct < 0:
             return True
-        if self.change_pct >= WATCH_ANTI_PEAK_PCT:
+        if self._is_dumping_from_peak():
             if self.age_sec >= WATCH_MIN_OBSERVE_SEC:
                 return True
         return False

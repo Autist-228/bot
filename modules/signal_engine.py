@@ -50,6 +50,7 @@ def compute_onchain_score(token: dict) -> int:
 
 async def scan_and_score() -> list[dict]:
     signals = []
+    pending_signals = []
 
     tokens = await get_trending_tokens(limit=25)
     logger.info("Codex returned %d trending tokens", len(tokens))
@@ -150,21 +151,46 @@ async def scan_and_score() -> list[dict]:
         }
 
         if total_score >= SIGNAL_THRESHOLD:
+            pending_signals.append({
+                "token": token,
+                "details": details,
+                "total_score": total_score,
+                "social_data": social_data,
+                "safety": safety,
+                "honeypot": honeypot,
+                "onchain_score": onchain_score,
+                "social_score": social_score,
+                "safety_score": safety_score,
+            })
+
+    if pending_signals:
+        await asyncio.sleep(5)
+        momentum_tasks = [
+            get_token_price(s["token"]["address"]) for s in pending_signals
+        ]
+        prices_after = await asyncio.gather(*momentum_tasks, return_exceptions=True)
+
+        for sig_data, price_after in zip(pending_signals, prices_after):
+            token = sig_data["token"]
+            address = token["address"]
+            symbol = token["symbol"]
+            total_score = sig_data["total_score"]
             price_before = token["price_usd"]
+
+            if isinstance(price_after, Exception) or not price_after or price_after <= 0:
+                price_after = price_before
+
             if price_before > 0:
-                await asyncio.sleep(15)
-                price_after = await get_token_price(address)
-                if price_after and price_after > 0:
-                    momentum = ((price_after - price_before) / price_before) * 100
-                    if momentum < -5:
-                        logger.info(
-                            "SKIP %s: negative momentum %.1f%% (price dropped during confirmation)",
-                            symbol, momentum,
-                        )
-                        continue
-                    if momentum > 0:
-                        total_score += 1
-                    token["price_usd"] = price_after
+                momentum = ((price_after - price_before) / price_before) * 100
+                if momentum < -10:
+                    logger.info(
+                        "SKIP %s: negative momentum %.1f%% (price dropped during confirmation)",
+                        symbol, momentum,
+                    )
+                    continue
+                if momentum > 0:
+                    total_score += 1
+                token["price_usd"] = price_after
 
             signal_id = await save_signal(
                 token_address=address,
@@ -175,21 +201,21 @@ async def scan_and_score() -> list[dict]:
                 liquidity=token["liquidity"],
                 volume=token["volume_24h"],
                 score=total_score,
-                details=json.dumps(details, default=str),
+                details=json.dumps(sig_data["details"], default=str),
             )
             signals.append({
                 "signal_id": signal_id,
                 "token": token,
-                "details": details,
+                "details": sig_data["details"],
                 "total_score": total_score,
-                "social_data": social_data,
-                "safety": safety,
-                "honeypot": honeypot,
+                "social_data": sig_data["social_data"],
+                "safety": sig_data["safety"],
+                "honeypot": sig_data["honeypot"],
             })
             logger.info(
                 "SIGNAL: %s (%s) score=%d [on-chain=%d social=%d safety=%d]",
                 symbol, address[:12], total_score,
-                onchain_score, social_score, safety_score,
+                sig_data["onchain_score"], sig_data["social_score"], sig_data["safety_score"],
             )
 
     return signals
