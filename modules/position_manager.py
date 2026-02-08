@@ -99,13 +99,14 @@ class Position:
         if self.peak_pnl_pct < 5:
             return False
         drop_from_peak = self.peak_pnl_pct - self.pnl_pct
-        stop = self.trailing_stop_pct
-        if self.ladder_step >= 2:
-            stop = 30.0
+        if self.peak_pnl_pct >= 100:
+            stop = 50.0
         elif self.peak_pnl_pct >= 50:
-            stop = 25.0
+            stop = 35.0
         elif self.peak_pnl_pct >= 20:
-            stop = 20.0
+            stop = 25.0
+        else:
+            stop = self.trailing_stop_pct
         if self.score >= 9:
             stop *= 1.3
         elif self.score >= 8:
