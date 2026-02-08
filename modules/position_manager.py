@@ -12,15 +12,15 @@ from modules.trader import JupiterTrader
 
 logger = logging.getLogger(__name__)
 
-BANK_PERCENT = 0.05
+BANK_PERCENT = 0.10
 MAX_POSITIONS = 5
-TRAILING_STOP_PCT = 15.0
+TRAILING_STOP_PCT = 12.0
 QUICK_EXIT_TIME_SEC = 180
 QUICK_EXIT_DROP_PCT = 20.0
 DEAD_TOKEN_TIME_SEC = 300
 DEAD_TOKEN_MIN_CHANGE_PCT = 2.0
-PROFIT_LOCK_THRESHOLD_PCT = 50.0
-PROFIT_LOCK_STOP_PCT = 30.0
+PROFIT_LOCK_THRESHOLD_PCT = 30.0
+PROFIT_LOCK_STOP_PCT = 20.0
 ROCKET_THRESHOLD_PCT = 100.0
 ROCKET_SELL_FRACTION = 0.5
 
@@ -82,7 +82,9 @@ class Position:
         drop_from_peak = self.peak_pnl_pct - self.pnl_pct
         stop = self.trailing_stop_pct
         if self.profit_locked:
-            stop = TRAILING_STOP_PCT * 0.7
+            stop = TRAILING_STOP_PCT * 0.6
+        elif self.peak_pnl_pct >= 20:
+            stop = TRAILING_STOP_PCT * 0.8
         if drop_from_peak >= stop:
             return True
         return False
