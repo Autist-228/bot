@@ -110,6 +110,50 @@ def format_signal_alert(signal: dict) -> str:
     return "\n".join(lines)
 
 
+def format_trade_open(pos_dict: dict) -> str:
+    lines = [
+        f"<b>BUY {pos_dict['symbol']}</b>",
+        f"Price: <b>${pos_dict['entry_price']:.10f}</b>",
+        f"Size: <b>{pos_dict['sol_spent']:.4f} SOL</b>",
+        f"Score: <b>{pos_dict['score']}</b>",
+        f"Tokens: <b>{pos_dict['tokens_held']:,}</b>",
+        f"\n<code>{pos_dict['token_mint']}</code>",
+    ]
+    return "\n".join(lines)
+
+
+def format_trade_close(pos_dict: dict) -> str:
+    pnl = pos_dict["pnl_pct"]
+    tag = "PROFIT" if pnl > 0 else "LOSS"
+    lines = [
+        f"<b>SELL {pos_dict['symbol']} — {tag}</b>",
+        f"PnL: <b>{pnl:+.1f}%</b>",
+        f"Peak: <b>+{pos_dict['peak_pnl_pct']:.1f}%</b>",
+        f"Reason: <b>{pos_dict['exit_reason']}</b>",
+        f"SOL back: <b>{pos_dict['sol_received']:.4f}</b>",
+        f"Hold time: <b>{pos_dict['age_sec']}s</b>",
+    ]
+    return "\n".join(lines)
+
+
+def format_portfolio(stats: dict) -> str:
+    lines = [
+        f"<b>Portfolio</b>",
+        f"Bank: <b>{stats['bank_sol']:.4f} SOL</b>",
+        f"PnL: <b>{stats['total_pnl_sol']:+.4f} SOL</b>",
+        f"Open: <b>{stats['open_positions']}</b> | Closed: <b>{stats['closed_trades']}</b>",
+        f"Wins: <b>{stats['wins']}</b> | Losses: <b>{stats['losses']}</b>",
+        f"Win rate: <b>{stats['win_rate']}%</b>",
+    ]
+    for p in stats.get("positions", []):
+        lines.append(
+            f"\n{p['symbol']}: <b>{p['pnl_pct']:+.1f}%</b> "
+            f"(peak +{p['peak_pnl_pct']:.1f}%) "
+            f"{'LOCKED' if p['profit_locked'] else ''}"
+        )
+    return "\n".join(lines)
+
+
 def format_stats_message(stats: dict) -> str:
     return (
         f"<b>Bot Statistics</b>\n\n"

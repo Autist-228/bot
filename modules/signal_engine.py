@@ -72,20 +72,38 @@ async def scan_and_score() -> list[dict]:
 
         honeypot = await check_honeypot_helius(address)
 
+        if onchain_score < 2:
+            logger.debug("SKIP %s: weak on-chain score %d", symbol, onchain_score)
+            continue
+
+        top_pct = safety.get("top_holders_pct")
+        if top_pct is not None and top_pct > 30:
+            logger.debug("SKIP %s: top holders %.1f%%", symbol, top_pct)
+            continue
+
         total_score = 0
 
-        if onchain_score >= 3:
+        if onchain_score >= 5:
+            total_score += 4
+        elif onchain_score >= 3:
             total_score += 3
         elif onchain_score >= 2:
             total_score += 2
-        elif onchain_score >= 1:
+
+        tweet_count = social_data.get("tweet_count", 0)
+        total_likes = social_data.get("total_likes", 0)
+        influencers = social_data.get("influencer_mentions", 0)
+
+        if tweet_count == 0:
+            total_score -= 2
+        elif tweet_count >= 15 and total_likes >= 5:
+            total_score += 3
+        elif social_score >= 3:
+            total_score += 2
+        elif social_score >= 2:
             total_score += 1
 
-        if social_score >= 3:
-            total_score += 3
-        elif social_score >= 2:
-            total_score += 2
-        elif social_score >= 1:
+        if influencers >= 2:
             total_score += 1
 
         if safety_score >= 4:

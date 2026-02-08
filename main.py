@@ -5,7 +5,15 @@ import os
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SCAN_INTERVAL_SECONDS
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    SCAN_INTERVAL_SECONDS,
+    WALLET_PRIVATE_KEY,
+    DRY_RUN,
+    BANK_SOL,
+    POSITION_CHECK_INTERVAL,
+)
 from utils.database import init_db, get_signal_stats, get_active_tracked_tokens
 from modules.signal_engine import scan_and_score
 from modules.telegram_bot import (
@@ -13,8 +21,13 @@ from modules.telegram_bot import (
     format_signal_alert,
     format_stats_message,
     format_tracked_tokens,
+    format_trade_open,
+    format_trade_close,
+    format_portfolio,
 )
 from modules.price_tracker import update_all_prices
+from modules.trader import JupiterTrader
+from modules.position_manager import PositionManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +35,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("main")
+
+trader = JupiterTrader(private_key=WALLET_PRIVATE_KEY, dry_run=DRY_RUN)
+pm = PositionManager(trader=trader, bank_sol=BANK_SOL)
 
 
 async def run_scan_cycle():
@@ -31,12 +47,29 @@ async def run_scan_cycle():
             for sig in signals:
                 msg = format_signal_alert(sig)
                 await send_message(msg)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
+
+                pos = await pm.open_position(sig)
+                if pos:
+                    await send_message(format_trade_open(pos.to_dict()))
+
             logger.info("Sent %d signal alerts", len(signals))
         else:
             logger.info("No new signals this cycle")
     except Exception as e:
         logger.error("Scan cycle error: %s", e, exc_info=True)
+
+
+async def run_position_check():
+    try:
+        old_closed = len(pm.closed_positions)
+        await pm.check_positions()
+        new_closed = pm.closed_positions[old_closed:]
+        for c in new_closed:
+            await send_message(format_trade_close(c))
+            await asyncio.sleep(0.3)
+    except Exception as e:
+        logger.error("Position check error: %s", e, exc_info=True)
 
 
 async def run_price_update():
@@ -71,11 +104,13 @@ async def handle_commands():
                         continue
 
                     if text == "/start":
+                        mode = "DRY RUN" if DRY_RUN else "LIVE"
                         await send_message(
-                            "<b>Solana Smart Money Bot</b>\n\n"
+                            f"<b>Solana Smart Money Bot [{mode}]</b>\n\n"
                             "Commands:\n"
                             "/scan - Manual scan\n"
                             "/stats - Signal statistics\n"
+                            "/portfolio - Trading portfolio\n"
                             "/tracked - Active tracked tokens\n"
                             "/help - Help",
                             chat_id=chat_id,
@@ -88,6 +123,11 @@ async def handle_commands():
                         await send_message(
                             format_stats_message(stats), chat_id=chat_id
                         )
+                    elif text == "/portfolio":
+                        stats = pm.get_stats()
+                        await send_message(
+                            format_portfolio(stats), chat_id=chat_id
+                        )
                     elif text == "/tracked":
                         tokens = await get_active_tracked_tokens()
                         await send_message(
@@ -98,11 +138,13 @@ async def handle_commands():
                             "<b>Commands:</b>\n"
                             "/scan - Run manual scan now\n"
                             "/stats - Show signal statistics\n"
+                            "/portfolio - Trading portfolio & PnL\n"
                             "/tracked - Show active tracked tokens\n"
                             "/help - This message\n\n"
                             "Bot automatically scans every "
                             f"{SCAN_INTERVAL_SECONDS}s and sends alerts "
-                            "when strong signals are detected.",
+                            "when strong signals are detected.\n"
+                            f"Trading mode: <b>{'DRY RUN' if DRY_RUN else 'LIVE'}</b>",
                             chat_id=chat_id,
                         )
             except Exception as e:
@@ -120,16 +162,20 @@ async def scheduler_loop():
         if cycle % 5 == 0:
             await run_price_update()
 
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        for _ in range(SCAN_INTERVAL_SECONDS // POSITION_CHECK_INTERVAL):
+            await run_position_check()
+            await asyncio.sleep(POSITION_CHECK_INTERVAL)
 
 
 async def main():
     logger.info("Initializing database...")
     await init_db()
 
-    logger.info("Starting Solana Smart Money Bot...")
+    mode = "DRY RUN" if DRY_RUN else "LIVE"
+    logger.info("Starting Solana Smart Money Bot [%s]...", mode)
     await send_message(
-        "<b>Bot started!</b>\n"
+        f"<b>Bot started! [{mode}]</b>\n"
+        f"Bank: {BANK_SOL} SOL\n"
         f"Scan interval: {SCAN_INTERVAL_SECONDS}s\n"
         "Send /help for commands."
     )
