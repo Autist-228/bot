@@ -49,7 +49,7 @@ async def run_scan_cycle():
             bought = 0
             for sig in signals:
                 score = sig.get("total_score", 0)
-                safety = sig.get("safety_score", 0)
+                safety = sig.get("details", {}).get("safety_score", 0)
                 symbol = sig["token"]["symbol"]
                 if score >= 8 and safety >= 4:
                     msg = format_signal_alert(sig)
