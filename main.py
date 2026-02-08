@@ -46,12 +46,23 @@ async def run_scan_cycle():
     try:
         signals = await scan_and_score()
         if signals:
+            bought = 0
             for sig in signals:
-                msg = format_signal_alert(sig)
-                await send_message(msg)
-                await asyncio.sleep(0.3)
-                await watchlist.add(sig)
-            logger.info("Sent %d signals to watchlist", len(signals))
+                score = sig.get("total_score", 0)
+                safety = sig.get("safety_score", 0)
+                symbol = sig["token"]["symbol"]
+                if score >= 8 and safety >= 4:
+                    msg = format_signal_alert(sig)
+                    await send_message(msg)
+                    pos = await pm.open_position(sig)
+                    if pos:
+                        await send_message(format_trade_open(pos.to_dict()))
+                        bought += 1
+                        logger.info("FAST BUY: %s score=%d safety=%d", symbol, score, safety)
+                    await asyncio.sleep(0.3)
+                else:
+                    logger.info("SKIP %s: score=%d safety=%d (need 8+/4+)", symbol, score, safety)
+            logger.info("Cycle: %d signals, %d bought", len(signals), bought)
         else:
             logger.info("No new signals this cycle")
     except Exception as e:
@@ -59,20 +70,7 @@ async def run_scan_cycle():
 
 
 async def run_watchlist_check():
-    try:
-        confirmed = await watchlist.check()
-        for sig in confirmed:
-            wdata = sig.get("watchlist_data", {})
-            await send_message(
-                f"<b>CONFIRMED: ${sig['token']['symbol']}</b>\n"
-                f"Watched {wdata.get('watch_time_sec', 0)}s, grew +{wdata.get('growth_during_watch', 0):.1f}%\n"
-                f"Buying now!"
-            )
-            pos = await pm.open_position(sig)
-            if pos:
-                await send_message(format_trade_open(pos.to_dict()))
-    except Exception as e:
-        logger.error("Watchlist check error: %s", e, exc_info=True)
+    pass
 
 
 async def run_position_check():
@@ -167,9 +165,8 @@ async def handle_commands():
                 await asyncio.sleep(5)
 
 
-async def watchlist_position_loop():
+async def position_loop():
     while True:
-        await run_watchlist_check()
         await run_position_check()
         await asyncio.sleep(POSITION_CHECK_INTERVAL)
 
@@ -202,7 +199,7 @@ async def main():
 
     await asyncio.gather(
         scheduler_loop(),
-        watchlist_position_loop(),
+        position_loop(),
         handle_commands(),
     )
 
