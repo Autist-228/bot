@@ -5,7 +5,7 @@ import json
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import SIGNAL_THRESHOLD
-from modules.codex_tracker import get_trending_tokens
+from modules.codex_tracker import get_trending_tokens, get_token_price
 from modules.twitter_monitor import search_token_mentions, compute_social_score
 from modules.safety_check import check_token_safety, check_honeypot_helius
 from utils.database import already_signaled, save_signal
@@ -81,6 +81,12 @@ async def scan_and_score() -> list[dict]:
             logger.debug("SKIP %s: top holders %.1f%%", symbol, top_pct)
             continue
 
+        sell_5m = token.get("sell_count_5m", 0)
+        buy_5m = token.get("buy_count_5m", 0)
+        if sell_5m > 0 and buy_5m > 0 and sell_5m / buy_5m > 0.8:
+            logger.debug("SKIP %s: high sell pressure %.1f%%", symbol, sell_5m / buy_5m * 100)
+            continue
+
         total_score = 0
 
         if onchain_score >= 5:
@@ -144,6 +150,22 @@ async def scan_and_score() -> list[dict]:
         }
 
         if total_score >= SIGNAL_THRESHOLD:
+            price_before = token["price_usd"]
+            if price_before > 0:
+                await asyncio.sleep(15)
+                price_after = await get_token_price(address)
+                if price_after and price_after > 0:
+                    momentum = ((price_after - price_before) / price_before) * 100
+                    if momentum < -5:
+                        logger.info(
+                            "SKIP %s: negative momentum %.1f%% (price dropped during confirmation)",
+                            symbol, momentum,
+                        )
+                        continue
+                    if momentum > 0:
+                        total_score += 1
+                    token["price_usd"] = price_after
+
             signal_id = await save_signal(
                 token_address=address,
                 token_symbol=symbol,
