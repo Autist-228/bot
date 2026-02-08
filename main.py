@@ -16,6 +16,7 @@ from config import (
 )
 from utils.database import init_db, get_signal_stats, get_active_tracked_tokens
 from modules.signal_engine import scan_and_score
+from modules.codex_tracker import get_token_price
 from modules.telegram_bot import (
     send_message,
     format_signal_alert,
@@ -42,27 +43,49 @@ pm = PositionManager(trader=trader, bank_sol=BANK_SOL)
 watchlist = Watchlist()
 
 
+PRE_BUY_WAIT = 10
+
+
 async def run_scan_cycle():
     try:
         signals = await scan_and_score()
         if signals:
-            bought = 0
+            candidates = []
             for sig in signals:
                 score = sig.get("total_score", 0)
                 safety = sig.get("details", {}).get("safety_score", 0)
                 symbol = sig["token"]["symbol"]
                 if score >= 8 and safety >= 4:
+                    price_before = sig.get("token", {}).get("price_usd", 0) or 0
+                    candidates.append((sig, score, safety, symbol, price_before))
+                    logger.info("CANDIDATE %s: score=%d safety=%d price=%.10f, waiting %ds", symbol, score, safety, price_before, PRE_BUY_WAIT)
+                else:
+                    logger.info("SKIP %s: score=%d safety=%d (need 8+/4+)", symbol, score, safety)
+
+            if candidates:
+                await asyncio.sleep(PRE_BUY_WAIT)
+
+            bought = 0
+            for sig, score, safety, symbol, price_before in candidates:
+                address = sig["token"]["address"]
+                price_after = await get_token_price(address)
+                if price_after is None or price_before <= 0:
+                    logger.info("SKIP %s: can't get price after wait", symbol)
+                    continue
+                price_after = float(price_after)
+                change_pct = ((price_after - price_before) / price_before) * 100
+                if change_pct >= -5:
                     msg = format_signal_alert(sig)
                     await send_message(msg)
                     pos = await pm.open_position(sig)
                     if pos:
                         await send_message(format_trade_open(pos.to_dict()))
                         bought += 1
-                        logger.info("FAST BUY: %s score=%d safety=%d", symbol, score, safety)
+                        logger.info("BUY %s: score=%d safety=%d, price %.2f%% after %ds", symbol, score, safety, change_pct, PRE_BUY_WAIT)
                     await asyncio.sleep(0.3)
                 else:
-                    logger.info("SKIP %s: score=%d safety=%d (need 8+/4+)", symbol, score, safety)
-            logger.info("Cycle: %d signals, %d bought", len(signals), bought)
+                    logger.info("SKIP %s: price dropped %.2f%% in %ds (dumping)", symbol, change_pct, PRE_BUY_WAIT)
+            logger.info("Cycle: %d signals, %d candidates, %d bought", len(signals), len(candidates), bought)
         else:
             logger.info("No new signals this cycle")
     except Exception as e:
