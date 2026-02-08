@@ -4,7 +4,11 @@ import time
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import CODEX_API_KEY, CODEX_GRAPHQL_URL, SOLANA_NETWORK_ID
+from config import (
+    CODEX_API_KEY, CODEX_GRAPHQL_URL, SOLANA_NETWORK_ID,
+    MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD, MIN_BUY_COUNT_5M,
+    MAX_TOKEN_AGE_HOURS, MAX_HOLDERS_EARLY, MIN_HOLDERS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,15 +74,16 @@ async def get_trending_tokens(limit: int = 25) -> list[dict]:
     variables = {
         "filters": {
             "network": [SOLANA_NETWORK_ID],
-            "liquidity": {"gte": 5000},
-            "volume24": {"gte": 10000},
-            "buyCount5m": {"gte": 3},
-            "txnCount1": {"gte": 10},
-            "createdAt": {"gte": now - 48 * 3600},
+            "liquidity": {"gte": MIN_LIQUIDITY_USD},
+            "volume24": {"gte": MIN_VOLUME_24H_USD},
+            "buyCount5m": {"gte": MIN_BUY_COUNT_5M},
+            "txnCount1": {"gte": 5},
+            "createdAt": {"gte": now - MAX_TOKEN_AGE_HOURS * 3600},
+            "holders": {"gte": MIN_HOLDERS, "lte": MAX_HOLDERS_EARLY},
         },
         "limit": limit,
         "rankings": [
-            {"attribute": "volume24", "direction": "DESC"}
+            {"attribute": "buyCount5m", "direction": "DESC"}
         ],
     }
     data = await _query(query, variables)

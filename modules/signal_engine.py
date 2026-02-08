@@ -16,26 +16,33 @@ logger = logging.getLogger(__name__)
 def compute_onchain_score(token: dict) -> int:
     score = 0
 
-    if token.get("volume_24h", 0) >= 50000:
+    vol = token.get("volume_24h", 0)
+    if vol >= 20000:
         score += 2
-    elif token.get("volume_24h", 0) >= 20000:
+    elif vol >= 5000:
         score += 1
 
     change_5m = token.get("change_5m", 0)
-    if change_5m >= 10:
+    if change_5m >= 15:
         score += 2
     elif change_5m >= 5:
         score += 1
 
-    if token.get("unique_buys_5m", 0) >= 10:
+    unique_buys = token.get("unique_buys_5m", 0)
+    if unique_buys >= 8:
+        score += 2
+    elif unique_buys >= 4:
         score += 1
 
-    if token.get("holders", 0) >= 100:
+    holders = token.get("holders", 0)
+    if 30 <= holders <= 300:
         score += 1
 
     buy_5m = token.get("buy_count_5m", 0)
     sell_5m = token.get("sell_count_5m", 0)
-    if buy_5m > 0 and sell_5m > 0 and buy_5m / sell_5m >= 2:
+    if sell_5m > 0 and buy_5m / sell_5m >= 2:
+        score += 1
+    elif sell_5m == 0 and buy_5m >= 5:
         score += 1
 
     return min(score, 8)
