@@ -11,12 +11,14 @@ from config import CODEX_API_KEY, CODEX_GRAPHQL_URL, SOLANA_NETWORK_ID
 logger = logging.getLogger(__name__)
 
 WATCH_CHECK_INTERVAL_SEC = 15
-WATCH_MAX_TIME_SEC = 180
-WATCH_MIN_TIME_SEC = 60
+WATCH_MAX_TIME_SEC = 90
+WATCH_MIN_OBSERVE_SEC = 15
+WATCH_MIN_TIME_SEC = 45
 WATCH_CONFIRM_GROWTH_PCT = 8.0
-WATCH_FAST_CONFIRM_PCT = 15.0
+WATCH_FAST_CONFIRM_PCT = 20.0
 WATCH_REJECT_DROP_PCT = -5.0
 WATCH_MAX_SLOTS = 10
+WATCH_ANTI_PEAK_PCT = 25.0
 
 
 class WatchItem:
@@ -58,20 +60,42 @@ class WatchItem:
             self.peak_price = price
 
     def is_confirmed(self) -> bool:
+        if self.age_sec < WATCH_MIN_OBSERVE_SEC:
+            return False
+        if self.change_pct >= WATCH_ANTI_PEAK_PCT:
+            return False
         if self.age_sec >= WATCH_MIN_TIME_SEC and self.change_pct >= WATCH_CONFIRM_GROWTH_PCT:
-            return True
-        if self.change_pct >= WATCH_FAST_CONFIRM_PCT:
-            return True
+            if self._is_growth_stable():
+                return True
+        if self.age_sec >= WATCH_MIN_OBSERVE_SEC and self.change_pct >= WATCH_FAST_CONFIRM_PCT:
+            if self._is_growth_stable():
+                return True
         return False
 
+    def _is_growth_stable(self) -> bool:
+        if len(self.prices) < 2:
+            return True
+        last_price = self.prices[-1]
+        prev_price = self.prices[-2] if len(self.prices) >= 2 else self.entry_price
+        if prev_price > 0:
+            recent_drop = ((last_price - prev_price) / prev_price) * 100
+            if recent_drop < -10:
+                return False
+        return True
+
     def is_rejected(self) -> bool:
-        if self.change_pct <= WATCH_REJECT_DROP_PCT:
+        if self.age_sec >= WATCH_MIN_OBSERVE_SEC and self.change_pct <= WATCH_REJECT_DROP_PCT:
+            return True
+        if self.change_pct <= -20.0:
             return True
         if self.age_sec >= WATCH_MAX_TIME_SEC:
             if self.change_pct < WATCH_CONFIRM_GROWTH_PCT:
                 return True
-        if self.checks >= 3 and self.peak_change_pct > 10 and self.change_pct < 0:
+        if self.checks >= 2 and self.peak_change_pct > 10 and self.change_pct < 0:
             return True
+        if self.change_pct >= WATCH_ANTI_PEAK_PCT:
+            if self.age_sec >= WATCH_MIN_OBSERVE_SEC:
+                return True
         return False
 
 

@@ -1,5 +1,6 @@
 import logging
 import json
+import re
 import time
 import httpx
 
@@ -10,6 +11,17 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 logger = logging.getLogger(__name__)
 
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+
+def _escape_html(text: str) -> str:
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
+
+def _strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text)
 
 
 async def send_message(text: str, chat_id: str | None = None, parse_mode: str = "HTML"):
@@ -24,6 +36,10 @@ async def send_message(text: str, chat_id: str | None = None, parse_mode: str = 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(url, json=payload)
+            if resp.status_code == 400:
+                payload["text"] = _strip_html(text)
+                del payload["parse_mode"]
+                resp = await client.post(url, json=payload)
             resp.raise_for_status()
             return resp.json()
     except Exception as e:
