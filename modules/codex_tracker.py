@@ -162,7 +162,7 @@ async def get_token_top_traders(token_address: str) -> list[dict]:
 
 async def get_token_price(token_address: str) -> float | None:
     query = """
-    query GetPrice($inputs: [GetTokenPricesInput!]!) {
+    query GetPrice($inputs: [GetPriceInput]) {
         getTokenPrices(inputs: $inputs) {
             priceUsd
         }
