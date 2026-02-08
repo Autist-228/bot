@@ -154,6 +154,12 @@ class JupiterTrader:
                 tokens = int(usd_value / token_price_usd)
             else:
                 tokens = int(sol_amount * 1e9)
+            if tokens <= 0:
+                logger.warning(
+                    "DRY RUN SKIP: %s, %.4f SOL can't afford 1 token at $%.4f",
+                    token_mint[:12], sol_amount, token_price_usd,
+                )
+                return None
             tx_sig = f"dry_run_buy_{int(time.time())}"
             logger.info(
                 "DRY RUN BUY: %s, %.4f SOL -> %d tokens",
@@ -163,7 +169,7 @@ class JupiterTrader:
                 "tx_signature": tx_sig,
                 "token_mint": token_mint,
                 "sol_spent": sol_amount,
-                "tokens_received": max(tokens, 1),
+                "tokens_received": tokens,
                 "price_impact": 0.0,
                 "timestamp": time.time(),
             }

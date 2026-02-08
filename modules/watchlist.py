@@ -19,6 +19,7 @@ WATCH_FAST_CONFIRM_PCT = 20.0
 WATCH_REJECT_DROP_PCT = -5.0
 WATCH_MAX_SLOTS = 10
 WATCH_ANTI_PEAK_DROP_FROM_PEAK_PCT = 35.0
+WATCH_CONFIRM_CEILING_PCT = 30.0
 WATCH_DOUBLE_CONFIRM_SEC = 15
 WATCH_DOUBLE_CONFIRM_MAX_DROP_PCT = 5.0
 
@@ -67,6 +68,8 @@ class WatchItem:
         if self.age_sec < WATCH_MIN_OBSERVE_SEC:
             return False
         if self._is_dumping_from_peak():
+            return False
+        if self.change_pct >= WATCH_CONFIRM_CEILING_PCT:
             return False
         if self.age_sec >= WATCH_MIN_TIME_SEC and self.change_pct >= WATCH_CONFIRM_GROWTH_PCT:
             if self._is_growth_stable():

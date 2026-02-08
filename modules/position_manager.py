@@ -9,6 +9,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import CODEX_API_KEY, CODEX_GRAPHQL_URL, SOLANA_NETWORK_ID
 from modules.trader import JupiterTrader
+from modules.safety_check import check_honeypot_helius
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,19 @@ class PositionManager:
 
         if address in self.positions:
             logger.info("Already have position in %s", symbol)
+            return None
+
+        safety_data = signal.get("safety", {})
+        safety_score = signal.get("safety_score", 6)
+        if safety_score < 4:
+            logger.info("SKIP %s: safety_score too low (%d)", symbol, safety_score)
+            return None
+
+        honeypot = signal.get("honeypot", {})
+        if not honeypot:
+            honeypot = await check_honeypot_helius(address)
+        if honeypot.get("mint_disabled") is False and honeypot.get("mint_authority") not in (None, "unknown"):
+            logger.info("SKIP %s: mint authority still active (rug risk)", symbol)
             return None
 
         sol_amount = self.get_position_size_sol(signal["total_score"])
