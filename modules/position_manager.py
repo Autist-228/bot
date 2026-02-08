@@ -209,8 +209,8 @@ class PositionManager:
         honeypot = signal.get("honeypot", {})
         if not honeypot:
             honeypot = await check_honeypot_helius(address)
-        if honeypot.get("mint_disabled") is False and honeypot.get("mint_authority") not in (None, "unknown"):
-            logger.info("SKIP %s: mint authority still active (rug risk)", symbol)
+        if honeypot.get("freeze_disabled") is False and honeypot.get("freeze_authority") not in (None, "unknown"):
+            logger.info("SKIP %s: freeze authority active (can't sell = rug risk)", symbol)
             return None
 
         sol_amount = self.get_position_size_sol(signal["total_score"])
