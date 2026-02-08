@@ -21,7 +21,7 @@ BANK_PERCENT_BY_SCORE = {
     6: 0.07,
 }
 MAX_POSITIONS = 5
-TRAILING_STOP_PCT = 12.0
+TRAILING_STOP_PCT = 20.0
 QUICK_EXIT_TIME_SEC = 180
 QUICK_EXIT_DROP_PCT = 15.0
 MAX_LOSS_PCT = 25.0
@@ -100,12 +100,12 @@ class Position:
             return False
         drop_from_peak = self.peak_pnl_pct - self.pnl_pct
         stop = self.trailing_stop_pct
-        if self.profit_locked:
-            stop = TRAILING_STOP_PCT * 0.5
+        if self.ladder_step >= 2:
+            stop = 30.0
         elif self.peak_pnl_pct >= 50:
-            stop = TRAILING_STOP_PCT * 1.5
+            stop = 25.0
         elif self.peak_pnl_pct >= 20:
-            stop = TRAILING_STOP_PCT * 0.75
+            stop = 20.0
         if self.score >= 9:
             stop *= 1.3
         elif self.score >= 8:
