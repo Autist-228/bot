@@ -29,8 +29,12 @@ DEAD_TOKEN_TIME_SEC = 300
 DEAD_TOKEN_MIN_CHANGE_PCT = 2.0
 PROFIT_LOCK_THRESHOLD_PCT = 25.0
 PROFIT_LOCK_STOP_PCT = 20.0
-ROCKET_THRESHOLD_PCT = 100.0
-ROCKET_SELL_FRACTION = 0.5
+LADDER_STEPS = [
+    (25.0, 0.30),
+    (50.0, 0.30),
+    (100.0, 0.20),
+]
+LADDER_MOON_TRAILING_PCT = 25.0
 SOL_PRICE_CACHE_SEC = 60
 
 
@@ -63,6 +67,7 @@ class Position:
         self.trailing_stop_pct = TRAILING_STOP_PCT
         self.profit_locked = False
         self.partial_sold = False
+        self.ladder_step = 0
         self.exit_reason = ""
         self.sol_received = 0.0
 
@@ -114,10 +119,13 @@ class Position:
             return True
         return False
 
-    def should_partial_sell(self) -> bool:
-        if not self.partial_sold and self.pnl_pct >= ROCKET_THRESHOLD_PCT:
-            return True
-        return False
+    def next_ladder_sell(self) -> tuple[float, float] | None:
+        if self.ladder_step >= len(LADDER_STEPS):
+            return None
+        threshold, fraction = LADDER_STEPS[self.ladder_step]
+        if self.pnl_pct >= threshold:
+            return (threshold, fraction)
+        return None
 
     def should_dead_exit(self) -> bool:
         age = time.time() - self.entry_time
@@ -143,6 +151,7 @@ class Position:
             "age_sec": int(time.time() - self.entry_time),
             "profit_locked": self.profit_locked,
             "partial_sold": self.partial_sold,
+            "ladder_step": self.ladder_step,
         }
 
 
@@ -204,13 +213,6 @@ class PositionManager:
         safety_score = signal.get("safety_score", 6)
         if safety_score < 4:
             logger.info("SKIP %s: safety_score too low (%d)", symbol, safety_score)
-            return None
-
-        honeypot = signal.get("honeypot", {})
-        if not honeypot:
-            honeypot = await check_honeypot_helius(address)
-        if honeypot.get("freeze_disabled") is False and honeypot.get("freeze_authority") not in (None, "unknown"):
-            logger.info("SKIP %s: freeze authority active (can't sell = rug risk)", symbol)
             return None
 
         sol_amount = self.get_position_size_sol(signal["total_score"])
@@ -335,18 +337,19 @@ class PositionManager:
                 await self.close_position(address, "max_loss")
                 continue
 
-            if pos.should_profit_lock():
-                pos.profit_locked = True
-                logger.info(
-                    "PROFIT LOCKED %s: pnl=%.1f%%, tighter stop",
-                    pos.symbol,
-                    pos.pnl_pct,
+            ladder = pos.next_ladder_sell()
+            if ladder:
+                threshold, fraction = ladder
+                sold = await self.close_position(
+                    address, f"ladder_{threshold:.0f}pct", fraction=fraction
                 )
-
-            if pos.should_partial_sell():
-                await self.close_position(
-                    address, "rocket_partial_sell", fraction=ROCKET_SELL_FRACTION
-                )
+                if sold:
+                    pos.ladder_step += 1
+                    logger.info(
+                        "LADDER %s: sold %.0f%% at +%.0f%% (step %d/%d)",
+                        pos.symbol, fraction * 100, threshold,
+                        pos.ladder_step, len(LADDER_STEPS),
+                    )
                 continue
 
             if pos.should_trailing_stop():
