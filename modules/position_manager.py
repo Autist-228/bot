@@ -7,7 +7,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import CODEX_API_KEY, CODEX_GRAPHQL_URL, SOLANA_NETWORK_ID
+from config import CODEX_API_KEY, CODEX_GRAPHQL_URL, SOLANA_NETWORK_ID, BANK_PERCENT_PER_TRADE, FLAT_POSITION_SIZING
 from modules.trader import JupiterTrader
 from modules.safety_check import check_honeypot_helius
 
@@ -24,11 +24,13 @@ MAX_POSITIONS = 5
 TRAILING_STOP_PCT = 20.0
 QUICK_EXIT_TIME_SEC = 180
 QUICK_EXIT_DROP_PCT = 15.0
-MAX_LOSS_PCT = 25.0
+MAX_LOSS_PCT = 20.0
 DEAD_TOKEN_TIME_SEC = 300
 DEAD_TOKEN_MIN_CHANGE_PCT = 2.0
 PROFIT_LOCK_THRESHOLD_PCT = 25.0
 PROFIT_LOCK_STOP_PCT = 20.0
+RUG_PULL_DROP_PCT = 30.0
+DYNAMIC_FLOOR_RATIO = 0.4
 LADDER_STEPS = [
     (25.0, 0.30),
     (50.0, 0.30),
@@ -66,6 +68,8 @@ class Position:
         self.peak_pnl_pct = 0.0
         self.trailing_stop_pct = TRAILING_STOP_PCT
         self.profit_locked = False
+        self.profit_floor_pct = -999.0
+        self.prev_pnl_pct = 0.0
         self.partial_sold = False
         self.ladder_step = 0
         self.exit_reason = ""
@@ -74,6 +78,7 @@ class Position:
     def update_price(self, new_price: float):
         if new_price <= 0:
             return
+        self.prev_pnl_pct = self.pnl_pct
         self.current_price = new_price
         self.last_update = time.time()
 
@@ -83,6 +88,11 @@ class Position:
         if new_price > self.peak_price:
             self.peak_price = new_price
             self.peak_pnl_pct = self.pnl_pct
+
+        if self.peak_pnl_pct >= 25.0:
+            dynamic_floor = self.peak_pnl_pct * DYNAMIC_FLOOR_RATIO
+            if dynamic_floor > self.profit_floor_pct:
+                self.profit_floor_pct = dynamic_floor
 
     def should_quick_exit(self) -> bool:
         age = time.time() - self.entry_time
@@ -117,6 +127,17 @@ class Position:
 
     def should_profit_lock(self) -> bool:
         if not self.profit_locked and self.pnl_pct >= PROFIT_LOCK_THRESHOLD_PCT:
+            return True
+        return False
+
+    def should_profit_floor_exit(self) -> bool:
+        if self.profit_floor_pct > -999.0 and self.pnl_pct <= self.profit_floor_pct:
+            return True
+        return False
+
+    def should_rug_pull_exit(self) -> bool:
+        drop = self.prev_pnl_pct - self.pnl_pct
+        if drop >= RUG_PULL_DROP_PCT:
             return True
         return False
 
@@ -194,6 +215,8 @@ class PositionManager:
         return 0.0
 
     def get_position_size_sol(self, score: int = 6) -> float:
+        if FLAT_POSITION_SIZING:
+            return self.bank_sol * BANK_PERCENT_PER_TRADE
         pct = BANK_PERCENT_BY_SCORE.get(score, 0.07)
         return self.bank_sol * pct
 
@@ -330,12 +353,29 @@ class PositionManager:
             if price > 0:
                 pos.update_price(price)
 
+            if pos.should_rug_pull_exit():
+                logger.info(
+                    "RUG PULL %s: dropped %.1f%% in one cycle (%.1f%% -> %.1f%%)",
+                    pos.symbol, pos.prev_pnl_pct - pos.pnl_pct,
+                    pos.prev_pnl_pct, pos.pnl_pct,
+                )
+                await self.close_position(address, "rug_pull")
+                continue
+
             if pos.should_quick_exit():
                 await self.close_position(address, "quick_exit_dump")
                 continue
 
             if pos.should_max_loss_exit():
                 await self.close_position(address, "max_loss")
+                continue
+
+            if pos.should_profit_floor_exit():
+                logger.info(
+                    "PROFIT FLOOR %s: pnl %.1f%% hit floor %.1f%% (peak was +%.1f%%)",
+                    pos.symbol, pos.pnl_pct, pos.profit_floor_pct, pos.peak_pnl_pct,
+                )
+                await self.close_position(address, "profit_floor")
                 continue
 
             ladder = pos.next_ladder_sell()

@@ -55,7 +55,9 @@ async def run_scan_cycle():
                 score = sig.get("total_score", 0)
                 safety = sig.get("details", {}).get("safety_score", 0)
                 symbol = sig["token"]["symbol"]
-                if score >= 8 and safety >= 4:
+                twitter_down = sig.get("details", {}).get("social", {}).get("tweet_count", 0) == 0 and "error" in str(sig.get("social_data", {}))
+                min_score = 7 if twitter_down else 8
+                if score >= min_score and safety >= 4:
                     price_before = sig.get("token", {}).get("price_usd", 0) or 0
                     candidates.append((sig, score, safety, symbol, price_before))
                     logger.info("CANDIDATE %s: score=%d safety=%d price=%.10f, waiting %ds", symbol, score, safety, price_before, PRE_BUY_WAIT)

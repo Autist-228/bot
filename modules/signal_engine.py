@@ -133,8 +133,11 @@ async def scan_and_score() -> list[dict]:
         tweet_count = social_data.get("tweet_count", 0)
         total_likes = social_data.get("total_likes", 0)
         influencers = social_data.get("influencer_mentions", 0)
+        twitter_error = social_data.get("error")
 
-        if tweet_count == 0:
+        if twitter_error:
+            pass
+        elif tweet_count == 0:
             total_score -= 2
         elif tweet_count >= 15 and total_likes >= 5:
             total_score += 3
@@ -143,7 +146,7 @@ async def scan_and_score() -> list[dict]:
         elif social_score >= 2:
             total_score += 1
 
-        if influencers >= 2:
+        if not twitter_error and influencers >= 2:
             total_score += 1
 
         if safety_score >= 4:
