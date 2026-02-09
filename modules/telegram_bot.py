@@ -1,5 +1,6 @@
 import logging
 import json
+import re
 import time
 import httpx
 
@@ -10,6 +11,17 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 logger = logging.getLogger(__name__)
 
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+
+def _escape_html(text: str) -> str:
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
+
+def _strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text)
 
 
 async def send_message(text: str, chat_id: str | None = None, parse_mode: str = "HTML"):
@@ -24,6 +36,10 @@ async def send_message(text: str, chat_id: str | None = None, parse_mode: str = 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(url, json=payload)
+            if resp.status_code == 400:
+                payload["text"] = _strip_html(text)
+                del payload["parse_mode"]
+                resp = await client.post(url, json=payload)
             resp.raise_for_status()
             return resp.json()
     except Exception as e:
@@ -107,6 +123,50 @@ def format_signal_alert(signal: dict) -> str:
     lines.append(f"\n<a href='{dexscreener}'>DexScreener</a> | <a href='{birdeye}'>Birdeye</a>")
     lines.append(f"\n<code>{address}</code>")
 
+    return "\n".join(lines)
+
+
+def format_trade_open(pos_dict: dict) -> str:
+    lines = [
+        f"<b>BUY {pos_dict['symbol']}</b>",
+        f"Price: <b>${pos_dict['entry_price']:.10f}</b>",
+        f"Size: <b>{pos_dict['sol_spent']:.4f} SOL</b>",
+        f"Score: <b>{pos_dict['score']}</b>",
+        f"Tokens: <b>{pos_dict['tokens_held']:,}</b>",
+        f"\n<code>{pos_dict['token_mint']}</code>",
+    ]
+    return "\n".join(lines)
+
+
+def format_trade_close(pos_dict: dict) -> str:
+    pnl = pos_dict["pnl_pct"]
+    tag = "PROFIT" if pnl > 0 else "LOSS"
+    lines = [
+        f"<b>SELL {pos_dict['symbol']} — {tag}</b>",
+        f"PnL: <b>{pnl:+.1f}%</b>",
+        f"Peak: <b>+{pos_dict['peak_pnl_pct']:.1f}%</b>",
+        f"Reason: <b>{pos_dict['exit_reason']}</b>",
+        f"SOL back: <b>{pos_dict['sol_received']:.4f}</b>",
+        f"Hold time: <b>{pos_dict['age_sec']}s</b>",
+    ]
+    return "\n".join(lines)
+
+
+def format_portfolio(stats: dict) -> str:
+    lines = [
+        f"<b>Portfolio</b>",
+        f"Bank: <b>{stats['bank_sol']:.4f} SOL</b>",
+        f"PnL: <b>{stats['total_pnl_sol']:+.4f} SOL</b>",
+        f"Open: <b>{stats['open_positions']}</b> | Closed: <b>{stats['closed_trades']}</b>",
+        f"Wins: <b>{stats['wins']}</b> | Losses: <b>{stats['losses']}</b>",
+        f"Win rate: <b>{stats['win_rate']}%</b>",
+    ]
+    for p in stats.get("positions", []):
+        lines.append(
+            f"\n{p['symbol']}: <b>{p['pnl_pct']:+.1f}%</b> "
+            f"(peak +{p['peak_pnl_pct']:.1f}%) "
+            f"{'LOCKED' if p['profit_locked'] else ''}"
+        )
     return "\n".join(lines)
 
 
