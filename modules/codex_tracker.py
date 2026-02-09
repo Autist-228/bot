@@ -29,7 +29,7 @@ async def _query(query: str, variables: dict | None = None) -> dict:
             data = resp.json()
             if "errors" in data:
                 logger.error("Codex GraphQL errors: %s", data["errors"])
-            return data.get("data", {})
+            return data.get("data") or {}
     except Exception as e:
         logger.error("Codex query error: %s", e)
         return {}
