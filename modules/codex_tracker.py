@@ -35,59 +35,59 @@ async def _query(query: str, variables: dict | None = None) -> dict:
         return {}
 
 
-async def get_trending_tokens(limit: int = 25) -> list[dict]:
-    query = """
-    query FilterTokens($filters: TokenFilters, $limit: Int, $rankings: [TokenRanking]) {
-        filterTokens(filters: $filters, limit: $limit, rankings: $rankings) {
-            results {
-                token {
+FILTER_QUERY = """
+query FilterTokens($filters: TokenFilters, $limit: Int, $rankings: [TokenRanking]) {
+    filterTokens(filters: $filters, limit: $limit, rankings: $rankings) {
+        results {
+            token {
+                address
+                symbol
+                name
+                networkId
+                isScam
+                info {
                     address
-                    symbol
-                    name
-                    networkId
+                    circulatingSupply
+                    totalSupply
                 }
-                priceUSD
-                liquidity
-                volume24
-                buyCount5m
-                sellCount5m
-                buyCount1
-                buyCount24
-                change5m
-                change1
-                change24
-                txnCount5m
-                txnCount1
-                txnCount24
-                holders
-                createdAt
-                marketCap
-                uniqueBuys5m
-                uniqueSells5m
-                uniqueBuys1
-                uniqueBuys24
             }
+            priceUSD
+            liquidity
+            volume24
+            buyCount5m
+            sellCount5m
+            buyCount1
+            buyCount24
+            change5m
+            change1
+            change24
+            txnCount5m
+            txnCount1
+            txnCount24
+            holders
+            createdAt
+            marketCap
+            uniqueBuys5m
+            uniqueSells5m
+            uniqueBuys1
+            uniqueBuys24
+            sniperCount
+            bundlerCount
+            insiderCount
+            devHeldPercentage
+            sniperHeldPercentage
+            bundlerHeldPercentage
+            insiderHeldPercentage
+            high5m
+            low5m
+            volumeChange5m
         }
     }
-    """
-    now = int(time.time())
-    variables = {
-        "filters": {
-            "network": [SOLANA_NETWORK_ID],
-            "liquidity": {"gte": MIN_LIQUIDITY_USD},
-            "volume24": {"gte": MIN_VOLUME_24H_USD},
-            "buyCount5m": {"gte": MIN_BUY_COUNT_5M},
-            "txnCount1": {"gte": 5},
-            "createdAt": {"gte": now - MAX_TOKEN_AGE_HOURS * 3600},
-            "holders": {"gte": MIN_HOLDERS, "lte": MAX_HOLDERS_EARLY},
-        },
-        "limit": limit,
-        "rankings": [
-            {"attribute": "buyCount5m", "direction": "DESC"}
-        ],
-    }
-    data = await _query(query, variables)
-    results = data.get("filterTokens", {}).get("results", [])
+}
+"""
+
+
+def _parse_results(results: list) -> list[dict]:
     tokens = []
     for r in results:
         token_info = r.get("token", {})
@@ -96,6 +96,7 @@ async def get_trending_tokens(limit: int = 25) -> list[dict]:
             "symbol": token_info.get("symbol", ""),
             "name": token_info.get("name", ""),
             "network_id": token_info.get("networkId", SOLANA_NETWORK_ID),
+            "is_scam": token_info.get("isScam", False),
             "price_usd": _safe_float(r.get("priceUSD")),
             "liquidity": _safe_float(r.get("liquidity")),
             "volume_24h": _safe_float(r.get("volume24")),
@@ -115,8 +116,72 @@ async def get_trending_tokens(limit: int = 25) -> list[dict]:
             "unique_buys_5m": r.get("uniqueBuys5m", 0),
             "unique_buys_1h": r.get("uniqueBuys1", 0),
             "unique_buys_24h": r.get("uniqueBuys24", 0),
+            "sniper_count": r.get("sniperCount", 0) or 0,
+            "bundler_count": r.get("bundlerCount", 0) or 0,
+            "insider_count": r.get("insiderCount", 0) or 0,
+            "dev_held_pct": _safe_float(r.get("devHeldPercentage")),
+            "sniper_held_pct": _safe_float(r.get("sniperHeldPercentage")),
+            "bundler_held_pct": _safe_float(r.get("bundlerHeldPercentage")),
+            "insider_held_pct": _safe_float(r.get("insiderHeldPercentage")),
+            "high_5m": _safe_float(r.get("high5m")),
+            "low_5m": _safe_float(r.get("low5m")),
+            "volume_change_5m": _safe_float(r.get("volumeChange5m")),
         })
     return tokens
+
+
+async def _fetch_ranked(ranking_attr: str, limit: int, extra_filters: dict | None = None) -> list[dict]:
+    now = int(time.time())
+    filters = {
+        "network": [SOLANA_NETWORK_ID],
+        "liquidity": {"gte": MIN_LIQUIDITY_USD},
+        "volume24": {"gte": MIN_VOLUME_24H_USD},
+        "buyCount5m": {"gte": MIN_BUY_COUNT_5M},
+        "txnCount1": {"gte": 5},
+        "createdAt": {"gte": now - MAX_TOKEN_AGE_HOURS * 3600},
+        "holders": {"gte": MIN_HOLDERS, "lte": MAX_HOLDERS_EARLY},
+    }
+    if extra_filters:
+        filters.update(extra_filters)
+    variables = {
+        "filters": filters,
+        "limit": limit,
+        "rankings": [{"attribute": ranking_attr, "direction": "DESC"}],
+    }
+    data = await _query(FILTER_QUERY, variables)
+    results = data.get("filterTokens", {}).get("results", [])
+    return _parse_results(results)
+
+
+async def get_trending_tokens(limit: int = 50) -> list[dict]:
+    import asyncio
+    q1 = _fetch_ranked("change5m", limit)
+    q2 = _fetch_ranked("buyCount5m", limit)
+    q3 = _fetch_ranked("uniqueBuys5m", limit)
+
+    results = await asyncio.gather(q1, q2, q3, return_exceptions=True)
+
+    seen = set()
+    merged = []
+    for batch in results:
+        if isinstance(batch, Exception):
+            logger.error("Multi-query batch error: %s", batch)
+            continue
+        for token in batch:
+            addr = token["address"]
+            if addr in seen:
+                continue
+            seen.add(addr)
+            merged.append(token)
+
+    logger.info(
+        "Multi-query: %d unique tokens from 3 rankings (change5m=%d, buyCount5m=%d, uniqueBuys5m=%d)",
+        len(merged),
+        len(results[0]) if not isinstance(results[0], Exception) else 0,
+        len(results[1]) if not isinstance(results[1], Exception) else 0,
+        len(results[2]) if not isinstance(results[2], Exception) else 0,
+    )
+    return merged
 
 
 async def get_top_holders_percent(token_address: str) -> float | None:

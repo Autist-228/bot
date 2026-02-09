@@ -8,6 +8,7 @@ from config import SIGNAL_THRESHOLD
 from modules.codex_tracker import get_trending_tokens, get_token_price
 from modules.twitter_monitor import search_token_mentions, compute_social_score
 from modules.safety_check import check_token_safety, check_honeypot_helius
+from modules.dexscreener import get_dexscreener_signals
 from utils.database import already_signaled, save_signal
 
 logger = logging.getLogger(__name__)
@@ -52,14 +53,46 @@ async def scan_and_score() -> list[dict]:
     signals = []
     pending_signals = []
 
-    tokens = await get_trending_tokens(limit=25)
-    logger.info("Codex returned %d trending tokens", len(tokens))
+    codex_task = get_trending_tokens(limit=50)
+    dex_task = get_dexscreener_signals()
+    tokens, dex_addresses = await asyncio.gather(codex_task, dex_task, return_exceptions=True)
+    if isinstance(tokens, Exception):
+        logger.error("Codex fetch failed: %s", tokens)
+        tokens = []
+    if isinstance(dex_addresses, Exception):
+        logger.error("DexScreener fetch failed: %s", dex_addresses)
+        dex_addresses = set()
+    logger.info("Codex returned %d tokens (multi-query), DexScreener %d addresses", len(tokens), len(dex_addresses))
 
     for token in tokens:
         address = token["address"]
         symbol = token["symbol"]
 
         if await already_signaled(address):
+            continue
+
+        if token.get("is_scam"):
+            logger.info("SKIP %s: flagged as scam by Codex", symbol)
+            continue
+
+        sniper_count = token.get("sniper_count", 0)
+        bundler_count = token.get("bundler_count", 0)
+        insider_count = token.get("insider_count", 0)
+        dev_held = token.get("dev_held_pct", 0)
+        sniper_held = token.get("sniper_held_pct", 0)
+        bundler_held = token.get("bundler_held_pct", 0)
+        insider_held = token.get("insider_held_pct", 0)
+
+        if dev_held > 20:
+            logger.info("SKIP %s: dev holds %.1f%% (rug risk)", symbol, dev_held)
+            continue
+
+        if sniper_held + bundler_held + insider_held > 40:
+            logger.info(
+                "SKIP %s: bots hold %.1f%% (sniper=%.1f%% bundler=%.1f%% insider=%.1f%%)",
+                symbol, sniper_held + bundler_held + insider_held,
+                sniper_held, bundler_held, insider_held,
+            )
             continue
 
         onchain_score = compute_onchain_score(token)
@@ -121,6 +154,10 @@ async def scan_and_score() -> list[dict]:
         if honeypot.get("mint_disabled") and honeypot.get("freeze_disabled"):
             total_score += 1
 
+        if address in dex_addresses:
+            total_score += 1
+            logger.info("BOOST %s: +1 from DexScreener (boosted/profiled)", symbol)
+
         if not safety["is_safe"]:
             total_score = max(0, total_score - 2)
 
@@ -147,6 +184,15 @@ async def scan_and_score() -> list[dict]:
                 "buy_count_5m": token.get("buy_count_5m"),
                 "holders": token.get("holders"),
                 "unique_buys_5m": token.get("unique_buys_5m"),
+            },
+            "bot_data": {
+                "sniper_count": sniper_count,
+                "bundler_count": bundler_count,
+                "insider_count": insider_count,
+                "dev_held_pct": dev_held,
+                "sniper_held_pct": sniper_held,
+                "bundler_held_pct": bundler_held,
+                "insider_held_pct": insider_held,
             },
         }
 
