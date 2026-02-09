@@ -42,8 +42,14 @@ async def fetch_sol_price(client: httpx.AsyncClient):
             if pairs and isinstance(pairs, list):
                 SOL_PRICE_USD = float(pairs[0].get("priceUsd") or 200)
                 log.info("SOL price: $%.2f", SOL_PRICE_USD)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Failed to fetch SOL price: %s, using $%.0f", e, SOL_PRICE_USD)
+
+
+async def sol_price_updater(client: httpx.AsyncClient):
+    while True:
+        await asyncio.sleep(300)
+        await fetch_sol_price(client)
 
 
 async def enrich_batch(client: httpx.AsyncClient):
@@ -51,7 +57,7 @@ async def enrich_batch(client: httpx.AsyncClient):
         await asyncio.sleep(15)
         now = time.time()
         to_enrich = []
-        for mint, token in tokens.items():
+        for mint, token in list(tokens.items()):
             age = now - token["created_ts"]
             if age >= 120 and not token.get("enriched") and not token.get("enrich_tried"):
                 to_enrich.append(mint)
@@ -107,7 +113,7 @@ async def price_checker(client: httpx.AsyncClient):
         await asyncio.sleep(20)
         now = time.time()
         batch = []
-        for mint, token in tokens.items():
+        for mint, token in list(tokens.items()):
             age = now - token["created_ts"]
             if age >= 300 and not token.get("price_5m"):
                 batch.append((mint, 5))
@@ -265,7 +271,7 @@ async def listen_pumpportal():
                     mint = msg.get("mint", "")
                     if mint in trade_counts:
                         tx = msg["txType"]
-                        sol_amount = float(msg.get("solAmount") or 0) / 1e9 if msg.get("solAmount") else 0
+                        sol_amount = float(msg.get("solAmount") or 0)
                         tc = trade_counts[mint]
                         if tx == "buy":
                             tc["buys"] += 1
@@ -445,6 +451,7 @@ async def main():
         enricher = asyncio.create_task(enrich_batch(client))
         checker = asyncio.create_task(price_checker(client))
         printer = asyncio.create_task(stats_printer())
+        sol_updater = asyncio.create_task(sol_price_updater(client))
 
         await asyncio.sleep(duration)
 
@@ -456,6 +463,7 @@ async def main():
 
         enricher.cancel()
         checker.cancel()
+        sol_updater.cancel()
 
     filepath = save_data()
     log.info("DONE! Data: %s", filepath)
