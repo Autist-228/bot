@@ -20,11 +20,12 @@ BANK_PERCENT_BY_SCORE = {
     7: 0.09,
     6: 0.07,
 }
-MAX_POSITIONS = 5
+MAX_POSITIONS = 10
 TRAILING_STOP_PCT = 20.0
 QUICK_EXIT_TIME_SEC = 180
 QUICK_EXIT_DROP_PCT = 15.0
 MAX_LOSS_PCT = 20.0
+SNIPER_STOP_LOSS_PCT = 15.0
 DEAD_TOKEN_TIME_SEC = 300
 DEAD_TOKEN_MIN_CHANGE_PCT = 2.0
 PROFIT_LOCK_THRESHOLD_PCT = 25.0
@@ -32,9 +33,11 @@ PROFIT_LOCK_STOP_PCT = 20.0
 RUG_PULL_DROP_PCT = 30.0
 DYNAMIC_FLOOR_RATIO = 0.4
 LADDER_STEPS = [
-    (25.0, 0.30),
-    (50.0, 0.30),
-    (100.0, 0.20),
+    (25.0, 0.20),
+    (50.0, 0.20),
+    (100.0, 0.15),
+    (200.0, 0.15),
+    (300.0, 0.15),
 ]
 LADDER_MOON_TRAILING_PCT = 25.0
 SOL_PRICE_CACHE_SEC = 60
@@ -74,6 +77,7 @@ class Position:
         self.ladder_step = 0
         self.exit_reason = ""
         self.sol_received = 0.0
+        self.is_sniper = False
 
     def update_price(self, new_price: float):
         if new_price <= 0:
@@ -101,7 +105,8 @@ class Position:
         return False
 
     def should_max_loss_exit(self) -> bool:
-        if self.pnl_pct <= -MAX_LOSS_PCT:
+        limit = SNIPER_STOP_LOSS_PCT if self.is_sniper else MAX_LOSS_PCT
+        if self.pnl_pct <= -limit:
             return True
         return False
 

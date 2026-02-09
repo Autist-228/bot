@@ -30,6 +30,7 @@ from modules.price_tracker import update_all_prices
 from modules.trader import JupiterTrader
 from modules.position_manager import PositionManager
 from modules.watchlist import Watchlist
+from modules.sniper import scan_new_tokens
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +42,7 @@ logger = logging.getLogger("main")
 trader = JupiterTrader(private_key=WALLET_PRIVATE_KEY, dry_run=DRY_RUN)
 pm = PositionManager(trader=trader, bank_sol=BANK_SOL)
 watchlist = Watchlist()
+seen_sniper_tokens: set[str] = set()
 
 
 PRE_BUY_WAIT = 10
@@ -94,8 +96,53 @@ async def run_scan_cycle():
         logger.error("Scan cycle error: %s", e, exc_info=True)
 
 
-async def run_watchlist_check():
-    pass
+async def run_sniper_cycle():
+    try:
+        candidates = await scan_new_tokens()
+        if not candidates:
+            logger.info("SNIPER: no new candidates")
+            return
+
+        bought = 0
+        for sig in candidates:
+            address = sig["token"]["address"]
+            symbol = sig["token"]["symbol"]
+
+            if address in seen_sniper_tokens:
+                continue
+            seen_sniper_tokens.add(address)
+
+            if address in pm.positions:
+                continue
+
+            price_before = sig["token"]["price_usd"]
+            if price_before <= 0:
+                continue
+
+            await asyncio.sleep(3)
+            price_after = await get_token_price(address)
+            if price_after is None or float(price_after) <= 0:
+                logger.info("SNIPER SKIP %s: no price after wait", symbol)
+                continue
+            price_after = float(price_after)
+            change_pct = ((price_after - price_before) / price_before) * 100
+
+            if change_pct < -10:
+                logger.info("SNIPER SKIP %s: dumping %.1f%% in 3s", symbol, change_pct)
+                continue
+
+            sig["token"]["price_usd"] = price_after
+            pos = await pm.open_position(sig)
+            if pos:
+                pos.is_sniper = True
+                bought += 1
+                logger.info("SNIPER BUY %s: age=%ds, price_change=%.1f%%, score=%d",
+                    symbol, sig["details"].get("age_sec", 0), change_pct, sig["total_score"])
+            await asyncio.sleep(0.3)
+
+        logger.info("SNIPER cycle: %d candidates, %d bought", len(candidates), bought)
+    except Exception as e:
+        logger.error("Sniper cycle error: %s", e, exc_info=True)
 
 
 async def run_position_check():
@@ -117,77 +164,10 @@ async def run_price_update():
         logger.error("Price update error: %s", e, exc_info=True)
 
 
-async def handle_commands():
-    from httpx import AsyncClient
-    offset = 0
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-    async with AsyncClient(timeout=30) as client:
-        while True:
-            try:
-                resp = await client.get(
-                    f"{api_url}/getUpdates",
-                    params={"offset": offset, "timeout": 5},
-                )
-                data = resp.json()
-                updates = data.get("result", [])
-
-                for update in updates:
-                    offset = update["update_id"] + 1
-                    message = update.get("message", {})
-                    text = message.get("text", "")
-                    chat_id = str(message.get("chat", {}).get("id", ""))
-
-                    if chat_id != TELEGRAM_CHAT_ID:
-                        continue
-
-                    if text == "/start":
-                        mode = "DRY RUN" if DRY_RUN else "LIVE"
-                        await send_message(
-                            f"<b>Solana Smart Money Bot [{mode}]</b>\n\n"
-                            "Commands:\n"
-                            "/scan - Manual scan\n"
-                            "/stats - Signal statistics\n"
-                            "/portfolio - Trading portfolio\n"
-                            "/tracked - Active tracked tokens\n"
-                            "/help - Help",
-                            chat_id=chat_id,
-                        )
-                    elif text == "/scan":
-                        await send_message("Scanning...", chat_id=chat_id)
-                        await run_scan_cycle()
-                    elif text == "/stats":
-                        stats = await get_signal_stats()
-                        await send_message(
-                            format_stats_message(stats), chat_id=chat_id
-                        )
-                    elif text == "/portfolio":
-                        stats = pm.get_stats()
-                        await send_message(
-                            format_portfolio(stats), chat_id=chat_id
-                        )
-                    elif text == "/tracked":
-                        tokens = await get_active_tracked_tokens()
-                        await send_message(
-                            format_tracked_tokens(tokens), chat_id=chat_id
-                        )
-                    elif text == "/help":
-                        await send_message(
-                            "<b>Commands:</b>\n"
-                            "/scan - Run manual scan now\n"
-                            "/stats - Show signal statistics\n"
-                            "/portfolio - Trading portfolio & PnL\n"
-                            "/tracked - Show active tracked tokens\n"
-                            "/help - This message\n\n"
-                            "Bot automatically scans every "
-                            f"{SCAN_INTERVAL_SECONDS}s and sends alerts "
-                            "when strong signals are detected.\n"
-                            f"Trading mode: <b>{'DRY RUN' if DRY_RUN else 'LIVE'}</b>",
-                            chat_id=chat_id,
-                        )
-            except Exception as e:
-                logger.error("Command handler error: %s", e)
-                await asyncio.sleep(5)
+async def sniper_loop():
+    while True:
+        await run_sniper_cycle()
+        await asyncio.sleep(15)
 
 
 async def position_loop():
@@ -225,7 +205,7 @@ async def main():
     await asyncio.gather(
         scheduler_loop(),
         position_loop(),
-        handle_commands(),
+        sniper_loop(),
     )
 
 
