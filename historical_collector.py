@@ -26,22 +26,41 @@ import httpx
 
 from config import DATA_DIR, PRICE_SNAPSHOT_INTERVALS, DEXSCREENER_API
 
-HELIUS_API_KEY = os.getenv(
-    "HELIUS_API_KEY", "7c8922d6-1031-42c1-b4ee-bf5daa29abd4"
-)
-HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-HELIUS_ENHANCED = (
-    f"https://api-mainnet.helius-rpc.com/v0/transactions/?api-key={HELIUS_API_KEY}"
-)
+API_KEYS = [
+    k.strip()
+    for k in os.getenv("HELIUS_API_KEYS", os.getenv("HELIUS_API_KEY", "")).split(",")
+    if k.strip()
+]
+
 PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 INITIAL_V_SOL = 30.0
 INITIAL_V_TOKENS = 1_073_000_000.0
 
 SOL_PRICE_USD = 82.0
-MAX_RPS = 25
+MAX_RPS_PER_KEY = 25
 BATCH_PARSE_SIZE = 100
 ENRICHMENT_BATCH = 30
+
+
+class KeyPool:
+    def __init__(self, keys):
+        self.keys = keys
+        self.limiters = [RateLimiter(MAX_RPS_PER_KEY) for _ in keys]
+        self._idx = 0
+
+    def next(self):
+        idx = self._idx % len(self.keys)
+        self._idx += 1
+        key = self.keys[idx]
+        limiter = self.limiters[idx]
+        rpc = f"https://mainnet.helius-rpc.com/?api-key={key}"
+        enhanced = f"https://api-mainnet.helius-rpc.com/v0/transactions/?api-key={key}"
+        return key, limiter, rpc, enhanced
+
+    def get_rpc(self, idx=0):
+        key = self.keys[idx % len(self.keys)]
+        return f"https://mainnet.helius-rpc.com/?api-key={key}", self.limiters[idx % len(self.keys)]
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -62,12 +81,17 @@ class RateLimiter:
         self.last_call = time.monotonic()
 
 
-async def rpc_call(client, method, params, limiter):
+async def rpc_call(client, method, params, limiter, rpc_url=None):
     await limiter.acquire()
+    url = rpc_url
+    if not url and API_KEYS:
+        url = f"https://mainnet.helius-rpc.com/?api-key={API_KEYS[0]}"
+    if not url:
+        raise ValueError("No API keys configured. Set HELIUS_API_KEYS env var.")
     for attempt in range(3):
         try:
             resp = await client.post(
-                HELIUS_RPC,
+                url,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
                 timeout=30,
             )
@@ -102,19 +126,24 @@ async def fetch_sol_price(client):
     log.info("SOL price: $%.2f", SOL_PRICE_USD)
 
 
-async def get_signatures(client, limiter, before=None, limit=1000):
+async def get_signatures(client, limiter, before=None, limit=1000, rpc_url=None):
     params = [PUMPFUN_PROGRAM, {"limit": limit, "commitment": "confirmed"}]
     if before:
         params[1]["before"] = before
-    return await rpc_call(client, "getSignaturesForAddress", params, limiter)
+    return await rpc_call(client, "getSignaturesForAddress", params, limiter, rpc_url)
 
 
-async def parse_enhanced(client, limiter, signatures):
+async def parse_enhanced(client, limiter, signatures, enhanced_url=None):
     await limiter.acquire()
+    url = enhanced_url
+    if not url and API_KEYS:
+        url = f"https://api-mainnet.helius-rpc.com/v0/transactions/?api-key={API_KEYS[0]}"
+    if not url:
+        raise ValueError("No API keys configured. Set HELIUS_API_KEYS env var.")
     for attempt in range(3):
         try:
             resp = await client.post(
-                HELIUS_ENHANCED,
+                url,
                 json={"transactions": signatures},
                 timeout=30,
             )
@@ -388,15 +417,28 @@ async def main():
     log.info("Enrich: %s", args.enrich)
     log.info("=" * 60)
 
-    limiter = RateLimiter(MAX_RPS)
+    pool = KeyPool(API_KEYS)
+    log.info("Using %d API keys for parallel parsing", len(API_KEYS))
     tokens_data = {}
     cutoff_ts = time.time() - (args.hours * 3600)
     start_time = time.time()
+    sem = asyncio.Semaphore(len(API_KEYS))
+
+    async def parse_batch_parallel(client, sigs_batch, pool, tokens_data):
+        async with sem:
+            _key, limiter, _rpc, enhanced = pool.next()
+            try:
+                parsed = await parse_enhanced(client, limiter, sigs_batch, enhanced)
+                if parsed:
+                    extract_events(parsed, tokens_data)
+            except Exception as e:
+                log.warning("Parse error: %s", e)
 
     async with httpx.AsyncClient() as client:
         await fetch_sol_price(client)
 
-        log.info("Phase 1: Scanning PumpFun program signatures...")
+        sig_rpc, sig_limiter = pool.get_rpc(0)
+        log.info("Phase 1: Scanning PumpFun program signatures (5 keys parallel)...")
         cursor = None
         total_sigs = 0
         batch_num = 0
@@ -407,7 +449,7 @@ async def main():
             batch_num += 1
 
             try:
-                sigs = await get_signatures(client, limiter, before=cursor)
+                sigs = await get_signatures(client, sig_limiter, before=cursor, rpc_url=sig_rpc)
             except Exception as e:
                 log.error("Sig fetch error: %s", e)
                 await asyncio.sleep(2)
@@ -422,14 +464,12 @@ async def main():
 
             valid_sigs = [s["signature"] for s in sigs if not s.get("err")]
 
+            tasks = []
             for i in range(0, len(valid_sigs), BATCH_PARSE_SIZE):
                 batch = valid_sigs[i : i + BATCH_PARSE_SIZE]
-                try:
-                    parsed = await parse_enhanced(client, limiter, batch)
-                    if parsed:
-                        extract_events(parsed, tokens_data)
-                except Exception as e:
-                    log.warning("Parse error: %s", e)
+                tasks.append(parse_batch_parallel(client, batch, pool, tokens_data))
+            if tasks:
+                await asyncio.gather(*tasks)
 
             if oldest_ts <= cutoff_ts:
                 reached_cutoff = True
