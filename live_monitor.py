@@ -116,7 +116,7 @@ def predict_token(token_data: dict) -> tuple[str, float]:
     X_scaled = scaler.transform(X)
     pred = model.predict(X_scaled)[0]
     proba = model.predict_proba(X_scaled)[0]
-    label = {0: "trash", 1: "winner", 2: "ROCKET"}.get(pred, "unknown")
+    label = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}.get(pred, "unknown")
     confidence = max(proba) * 100
     return label, confidence
 

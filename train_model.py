@@ -47,8 +47,9 @@ FEATURES = [
 ]
 
 LABEL_MAP = {
-    "ROCKET": 2,
-    "winner": 1,
+    "ROCKET": 3,
+    "winner": 2,
+    "good": 1,
     "flat": 0,
     "loser": 0,
     "dead": 0,
@@ -85,6 +86,17 @@ def load_data(data_dir: str | None = None) -> pd.DataFrame:
 
     df = pd.DataFrame(all_tokens)
 
+    if "best_change_pct" in df.columns:
+        log.info("Re-deriving outcomes from best_change_pct with new thresholds...")
+        df["outcome"] = df["best_change_pct"].apply(
+            lambda x: "ROCKET" if x >= 500
+            else "winner" if x >= 100
+            else "good" if x >= 50
+            else "flat" if x >= -15
+            else "loser" if x >= -50
+            else "dead"
+        )
+
     df = df[df["outcome"].isin(LABEL_MAP.keys())].copy()
     log.info("Tokens with valid outcome: %d", len(df))
 
@@ -93,7 +105,7 @@ def load_data(data_dir: str | None = None) -> pd.DataFrame:
         df = df[df["total_buys"] >= 1].copy()
         log.info("Tokens with at least 1 buy: %d / %d", len(df), before)
 
-    df["label"]= df["outcome"].map(LABEL_MAP)
+    df["label"] = df["outcome"].map(LABEL_MAP)
 
     for col in ["has_website", "has_socials", "migrated"]:
         if col in df.columns:
@@ -117,6 +129,7 @@ def analyze_patterns(df: pd.DataFrame):
 
     rockets = df[df["outcome"] == "ROCKET"]
     winners = df[df["outcome"] == "winner"]
+    good = df[df["outcome"] == "good"]
     trash = df[df["outcome"].isin(["flat", "loser", "dead"])]
 
     log.info("\n--- ROCKET vs TRASH comparison ---")
@@ -209,14 +222,8 @@ def train(df: pd.DataFrame, model_type: str = "rf"):
     y_pred = model.predict(X_test)
 
     labels = sorted(np.unique(y))
-    target_names = []
-    for l in labels:
-        if l == 0:
-            target_names.append("trash")
-        elif l == 1:
-            target_names.append("winner")
-        else:
-            target_names.append("ROCKET")
+    label_names = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}
+    target_names = [label_names.get(l, f"class_{l}") for l in labels]
 
     log.info("\nClassification Report:\n%s", classification_report(y_test, y_pred, target_names=target_names, zero_division=0))
     log.info("Confusion Matrix:\n%s", confusion_matrix(y_test, y_pred))
@@ -262,7 +269,7 @@ def predict_token(model, scaler, features: list[str], token_data: dict) -> str:
     pred = model.predict(X_scaled)[0]
     proba = model.predict_proba(X_scaled)[0]
 
-    label = {0: "trash", 1: "winner", 2: "ROCKET"}.get(pred, "unknown")
+    label = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}.get(pred, "unknown")
     confidence = max(proba) * 100
     return f"{label} ({confidence:.0f}%)"
 

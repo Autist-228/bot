@@ -385,10 +385,12 @@ def finalize_tokens():
 
         token["best_change_pct"] = round(best_change, 1)
 
-        if best_change >= 100:
+        if best_change >= 500:
             token["outcome"] = "ROCKET"
-        elif best_change >= 25:
+        elif best_change >= 100:
             token["outcome"] = "winner"
+        elif best_change >= 50:
+            token["outcome"] = "good"
         elif best_change >= -15:
             token["outcome"] = "flat"
         elif best_change >= -50:

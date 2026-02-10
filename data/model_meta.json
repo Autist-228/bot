@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-02-10T20:25:48.376406+00:00",
+  "trained_at": "2026-02-10T20:35:44.070229+00:00",
   "model_type": "rf",
   "n_samples": 630,
   "n_features": 25,
@@ -31,8 +31,9 @@
     "migrated"
   ],
   "label_map": {
-    "2": "ROCKET",
-    "1": "winner",
+    "3": "ROCKET",
+    "2": "winner",
+    "1": "good",
     "0": "dead"
   }
 }
