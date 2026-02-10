@@ -308,6 +308,7 @@ async def execute_real_buy(sig: dict, sol_amount: float):
         if result["success"]:
             sig["real_buy_tx"] = result["tx_hash"]
             sig["real_sol_spent"] = sol_amount
+            sig["buy_confirmed"] = True
             log.info("REAL BUY OK %s: %.4f SOL | tx=%s", sig["symbol"], sol_amount, result["tx_hash"][:20])
         else:
             log.error("REAL BUY FAILED %s: %s", sig["symbol"], result["error"])
@@ -316,11 +317,19 @@ async def execute_real_buy(sig: dict, sol_amount: float):
 
 
 async def execute_real_sell(sig: dict, sell_pct: int, reason: str):
+    if REAL_TRADING and not sig.get("buy_confirmed"):
+        log.warning("SELL SKIP %s: buy not confirmed yet, waiting...", sig["symbol"])
+        for _ in range(60):
+            await asyncio.sleep(0.5)
+            if sig.get("buy_confirmed"):
+                break
+        if not sig.get("buy_confirmed"):
+            log.error("SELL ABORT %s: buy never confirmed after 30s", sig["symbol"])
+            return {"success": False, "error": "buy not confirmed"}
     try:
         result = await trader.sell_token(sig["mint"], sell_pct, sig["symbol"], reason)
         if result["success"]:
-            sol_got = result.get("sol_received", 0)
-            log.info("REAL SELL OK %s %d%% (%s): tx=%s | +%.6f SOL", sig["symbol"], sell_pct, reason, result["tx_hash"][:20], sol_got)
+            log.info("REAL SELL OK %s %d%% (%s): tx=%s | balance=%.4f SOL", sig["symbol"], sell_pct, reason, result["tx_hash"][:20], trader.sol_balance)
         else:
             log.error("REAL SELL FAILED %s (%s): %s", sig["symbol"], reason, result.get("error", "not confirmed"))
         return result

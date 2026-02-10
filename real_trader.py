@@ -18,7 +18,9 @@ log = logging.getLogger("real_trader")
 
 PUMPPORTAL_TRADE_URL = "https://pumpportal.fun/api/trade-local"
 SOL_MINT = "So11111111111111111111111111111111111111112"
-SLIPPAGE = 25
+SLIPPAGE_BUY = 25
+SLIPPAGE_SELL = 50
+SLIPPAGE_SELL_RETRY = 80
 PRIORITY_FEE = 0.0001
 BET_SIZE_USD = 5.0
 TX_CONFIRM_TIMEOUT = 30
@@ -77,7 +79,10 @@ class RealTrader:
     async def _send_and_confirm(self, payload: dict, symbol: str, action: str) -> dict:
         result = {"success": False, "tx_hash": None, "error": None, "confirmed": False}
         sent_tx_hashes: list[str] = []
-        for attempt in range(1, TX_CONFIRM_RETRIES + 1):
+        max_retries = TX_CONFIRM_RETRIES
+        if action == "SELL":
+            max_retries = 3
+        for attempt in range(1, max_retries + 1):
             try:
                 if attempt > 1 and sent_tx_hashes:
                     prev_tx = sent_tx_hashes[-1]
@@ -90,12 +95,15 @@ class RealTrader:
                         result["tx_hash"] = prev_tx
                         self.refresh_balance()
                         return result
+                if action == "SELL" and attempt > 1:
+                    payload["slippage"] = SLIPPAGE_SELL_RETRY
+                    log.info("%s %s: retrying with slippage=%d%%", action, symbol, SLIPPAGE_SELL_RETRY)
                 async with httpx.AsyncClient() as client:
                     resp = await client.post(PUMPPORTAL_TRADE_URL, json=payload, timeout=15)
                 if resp.status_code != 200:
                     result["error"] = f"PumpPortal {resp.status_code}: {resp.text[:200]}"
                     log.error("%s FAIL %s attempt %d: %s", action, symbol, attempt, result["error"])
-                    if attempt < TX_CONFIRM_RETRIES:
+                    if attempt < max_retries:
                         await asyncio.sleep(1)
                     continue
                 tx_bytes = resp.content
@@ -108,7 +116,7 @@ class RealTrader:
                 tx_hash = str(tx_resp.value)
                 result["tx_hash"] = tx_hash
                 sent_tx_hashes.append(tx_hash)
-                log.info("%s %s sent tx=%s (attempt %d, confirming...)", action, symbol, tx_hash[:20], attempt)
+                log.info("%s %s sent tx=%s (attempt %d/%d, confirming...)", action, symbol, tx_hash[:20], attempt, max_retries)
                 confirmed = await asyncio.to_thread(self.confirm_tx, tx_hash)
                 if confirmed:
                     result["success"] = True
@@ -116,13 +124,13 @@ class RealTrader:
                     self.refresh_balance()
                     return result
                 else:
-                    log.warning("%s %s NOT confirmed (attempt %d/%d)", action, symbol, attempt, TX_CONFIRM_RETRIES)
-                    if attempt < TX_CONFIRM_RETRIES:
+                    log.warning("%s %s NOT confirmed (attempt %d/%d)", action, symbol, attempt, max_retries)
+                    if attempt < max_retries:
                         await asyncio.sleep(1)
             except Exception as e:
                 result["error"] = str(e)
                 log.error("%s ERROR %s attempt %d: %s", action, symbol, attempt, e)
-                if attempt < TX_CONFIRM_RETRIES:
+                if attempt < max_retries:
                     await asyncio.sleep(1)
         return result
 
@@ -152,11 +160,11 @@ class RealTrader:
             "mint": mint,
             "amount": sol_amount,
             "denominatedInSol": "true",
-            "slippage": SLIPPAGE,
+            "slippage": SLIPPAGE_BUY,
             "priorityFee": PRIORITY_FEE,
             "pool": "auto",
         }
-        log.info("BUY %s: %.4f SOL (slippage=%d%%)...", symbol, sol_amount, SLIPPAGE)
+        log.info("BUY %s: %.4f SOL (slippage=%d%%)...", symbol, sol_amount, SLIPPAGE_BUY)
 
         send_result = await self._send_and_confirm(payload, symbol, "BUY")
         result.update(send_result)
@@ -201,20 +209,17 @@ class RealTrader:
             "mint": mint,
             "amount": f"{sell_pct}%",
             "denominatedInSol": "false",
-            "slippage": SLIPPAGE,
+            "slippage": SLIPPAGE_SELL,
             "priorityFee": PRIORITY_FEE,
             "pool": "auto",
         }
-        log.info("SELL %s: %d%% (%s) slippage=%d%%...", symbol, sell_pct, reason, SLIPPAGE)
+        log.info("SELL %s: %d%% (%s) slippage=%d%%...", symbol, sell_pct, reason, SLIPPAGE_SELL)
 
         send_result = await self._send_and_confirm(payload, symbol, "SELL")
         result.update(send_result)
 
         if result["success"]:
-            await asyncio.sleep(2)
-            balance_after = self.refresh_balance()
-            sol_received = balance_after - balance_before
-            result["sol_received"] = sol_received
+            self.refresh_balance()
 
             if mint in self.positions:
                 pos = self.positions[mint]
@@ -226,13 +231,12 @@ class RealTrader:
                     "pct": actual_sold,
                     "tx": result["tx_hash"],
                     "time": time.time(),
-                    "sol_received": sol_received,
                     "reason": reason,
                 })
 
             log.info(
-                "SELL CONFIRMED %s %d%% (%s): tx=%s | got %.6f SOL | balance=%.4f SOL",
-                symbol, sell_pct, reason, result["tx_hash"][:20], sol_received, self.sol_balance,
+                "SELL CONFIRMED %s %d%% (%s): tx=%s | balance=%.4f SOL",
+                symbol, sell_pct, reason, result["tx_hash"][:20], self.sol_balance,
             )
         else:
             log.error("SELL FAILED %s after %d retries", symbol, TX_CONFIRM_RETRIES)
