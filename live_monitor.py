@@ -40,15 +40,11 @@ FEATURES = [
 MIN_BUYS_FOR_SIGNAL = 50
 MIN_RATIO_FOR_SIGNAL = 1.5
 STOP_LOSS_PCT = -10.0
-TIME_STOP_SEC = 120
+TIME_STOP_SEC = 60
 TIME_STOP_MIN_GAIN = 10.0
 TRAILING_STOP_PCT = 15.0
-TP_LADDER = [
-    {"level": 200.0, "sell_pct": 50},
-    {"level": 400.0, "sell_pct": 100},
-]
 PRICE_POLL_INTERVAL = 0.5
-MAX_SELLS_PER_TOKEN = 3
+MAX_SELLS_PER_TOKEN = 1
 MIN_LIQUIDITY_USD = 3000.0
 MAX_SLOTS = int(os.getenv("MAX_SLOTS", "10"))
 BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "5.0"))
@@ -361,8 +357,6 @@ async def signal_price_updater(client: httpx.AsyncClient):
                         sig["peak_pnl_pct"] = round(current_pnl, 1)
                     sig["checked_at"] = datetime.now(timezone.utc).isoformat()
 
-                    check_tp_ladder(sig, current_pnl)
-
                     reason = check_exit_rules(sig, current_pnl)
                     if reason:
                         close_signal(sig, reason, current_pnl)
@@ -485,7 +479,6 @@ async def listen_pumpportal():
                                     if ws_pnl > sig.get("peak_pnl_pct", 0):
                                         sig["peak_pnl_pct"] = round(ws_pnl, 1)
                                     sig["checked_at"] = datetime.now(timezone.utc).isoformat()
-                                    check_tp_ladder(sig, ws_pnl)
                                     reason = check_exit_rules(sig, ws_pnl)
                                     if reason:
                                         close_signal(sig, reason, ws_pnl)
@@ -620,7 +613,7 @@ def save_session():
             "time_stop_sec": TIME_STOP_SEC,
             "time_stop_min_gain": TIME_STOP_MIN_GAIN,
             "trailing_stop_pct": TRAILING_STOP_PCT,
-            "tp_ladder": TP_LADDER,
+            "tp_ladder": "DISABLED - trailing stop only",
         },
         "signals": signals,
         "tokens": list(tokens.values()),
@@ -646,11 +639,11 @@ async def main():
     mode_str = "REAL TRADING" if REAL_TRADING else "SIMULATION"
     log.info("LIVE ML MONITOR v5 [%s]", mode_str)
     log.info("Duration: %d seconds", duration)
-    log.info("Bet size: $%.0f | Max slots: %d | Max sells/token: %d", BET_SIZE_USD, MAX_SLOTS, MAX_SELLS_PER_TOKEN)
+    log.info("Bet size: $%.0f | Max slots: %d | 1 buy + 1 sell per token", BET_SIZE_USD, MAX_SLOTS)
     log.info("Filters: buys >= %d, ratio >= %.1f, liquidity >= $%.0f", MIN_BUYS_FOR_SIGNAL, MIN_RATIO_FOR_SIGNAL, MIN_LIQUIDITY_USD)
     log.info("Stop-loss: %.0f%% | Time-stop: %ds (min +%.0f%%)", STOP_LOSS_PCT, TIME_STOP_SEC, TIME_STOP_MIN_GAIN)
     log.info("Trailing stop: -%.0f%% from peak (activates at +30%%) | Price poll: %.1fs", TRAILING_STOP_PCT, PRICE_POLL_INTERVAL)
-    log.info("TP Ladder: %s", ", ".join(f"+{tp['level']:.0f}%->sell {tp['sell_pct']}%%" for tp in TP_LADDER))
+    log.info("Strategy: NO TP ladder, trailing stop only (1 sell per token)")
     log.info("=" * 60)
 
     if not load_model():
