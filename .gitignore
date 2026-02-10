@@ -11,3 +11,6 @@ env/
 dist/
 build/
 .eggs/
+data/*.json
+data/*.pkl
+data/*.joblib
