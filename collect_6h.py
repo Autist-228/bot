@@ -1,6 +1,6 @@
 """
 Autonomous 6-hour data collector for pump.fun tokens.
-Tracks each token for 30 minutes with price checks at 1m, 5m, 10m, 20m, 30m.
+Tracks each token for 15 minutes with price checks at 1m, 5m, 10m, 15m.
 Saves incrementally every 30 minutes. Runs fully unattended.
 """
 import asyncio
@@ -19,9 +19,14 @@ from config import PUMPPORTAL_WS_URL, DEXSCREENER_API, DATA_DIR
 
 DURATION = int(os.getenv("COLLECT_6H_DURATION", "25200"))
 SAVE_INTERVAL = 1800
-PRICE_CHECK_MINUTES = [1, 5, 10, 20, 30]
+PRICE_CHECK_MINUTES = [1, 5, 10, 15]
 ROCKET_THRESHOLD = 500
 WINNER_THRESHOLD = 100
+
+BUY_SLIPPAGE_SIM = 0.02
+SELL_SLIPPAGE_SIM = 0.03
+PUMPFUN_FEE_PCT = 0.01
+SIM_BET_SOL = 0.035
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -80,6 +85,32 @@ async def sol_price_loop(client: httpx.AsyncClient):
         await fetch_sol_price(client)
 
 
+def _calc_bc_pnl(token: dict) -> float | None:
+    v_sol_init = token.get("initial_v_sol", 0)
+    v_tokens_init = token.get("initial_v_tokens", 0)
+    if v_sol_init <= 0 or v_tokens_init <= 0:
+        return None
+    sol_after_fee = SIM_BET_SOL * (1 - PUMPFUN_FEE_PCT)
+    sol_eff = sol_after_fee * (1 - BUY_SLIPPAGE_SIM)
+    k_buy = v_sol_init * v_tokens_init
+    new_vs = v_sol_init + sol_eff
+    new_vt = k_buy / new_vs
+    sim_tokens = v_tokens_init - new_vt
+    if sim_tokens <= 0:
+        return None
+
+    cur_v_sol = token.get("v_sol_in_bonding", 0)
+    cur_v_tokens = token.get("v_tokens_in_bonding", 0)
+    if cur_v_sol <= 0 or cur_v_tokens <= 0:
+        return None
+    k_sell = cur_v_sol * cur_v_tokens
+    vt_after = cur_v_tokens + sim_tokens
+    vs_after = k_sell / vt_after
+    gross_out = cur_v_sol - vs_after
+    net_out = gross_out * (1 - PUMPFUN_FEE_PCT) * (1 - SELL_SLIPPAGE_SIM)
+    return ((net_out / SIM_BET_SOL) - 1) * 100
+
+
 async def listen_pumpportal():
     ws = None
     while not shutdown:
@@ -135,6 +166,8 @@ async def listen_pumpportal():
                         "initial_price_usd": price_usd,
                         "initial_mcap_usd": mcap_usd,
                         "initial_mcap_sol": mcap_sol,
+                        "initial_v_sol": v_sol,
+                        "initial_v_tokens": v_tokens,
                         "v_tokens_in_bonding": v_tokens,
                         "v_sol_in_bonding": v_sol,
                         "dev_address": msg.get("traderPublicKey", ""),
@@ -191,15 +224,49 @@ async def listen_pumpportal():
                     tc["last_trade_ts"] = now
 
                     new_mcap_sol = float(msg.get("marketCapSol") or 0)
+                    new_v_sol = float(msg.get("vSolInBondingCurve") or 0)
+                    new_v_tokens = float(msg.get("vTokensInBondingCurve") or 0)
+                    token = tokens[mint]
+
                     if new_mcap_sol > 0:
                         new_mcap_usd = new_mcap_sol * SOL_PRICE_USD
-                        token = tokens[mint]
                         token["latest_mcap_sol"] = new_mcap_sol
                         token["latest_mcap_usd"] = new_mcap_usd
                         if new_mcap_usd > token.get("peak_mcap_usd", 0):
                             token["peak_mcap_usd"] = new_mcap_usd
                             token["peak_mcap_sol"] = new_mcap_sol
                             token["peak_mcap_age_sec"] = int(now - token["created_ts"])
+
+                    if new_v_sol > 0:
+                        token["v_sol_in_bonding"] = new_v_sol
+                    if new_v_tokens > 0:
+                        token["v_tokens_in_bonding"] = new_v_tokens
+
+                    bc_pnl = _calc_bc_pnl(token)
+                    if bc_pnl is not None:
+                        token["latest_bc_pnl"] = round(bc_pnl, 1)
+                        prev_peak = token.get("peak_bc_pnl")
+                        if prev_peak is None or bc_pnl > prev_peak:
+                            token["peak_bc_pnl"] = round(bc_pnl, 1)
+                            token["peak_bc_pnl_age_sec"] = int(now - token["created_ts"])
+
+                    age = now - token["created_ts"]
+                    if "snapshot_60s" not in token and 30 <= age <= 300:
+                        buys = tc["buys"]
+                        sells = tc["sells"]
+                        token["snapshot_60s"] = {
+                            "snap_age": round(age, 1),
+                            "snap_buys": buys,
+                            "snap_sells": sells,
+                            "snap_buy_sol": round(tc["buy_sol"], 4),
+                            "snap_sell_sol": round(tc["sell_sol"], 4),
+                            "snap_v_sol": token.get("v_sol_in_bonding", 0),
+                            "snap_v_tokens": token.get("v_tokens_in_bonding", 0),
+                            "snap_ratio": round(buys / max(1, sells), 2),
+                            "snap_sell_pressure": round(sells / max(1, buys + sells) * 100, 1),
+                            "snap_unique_buyers": len(tc.get("unique_buyers", set())),
+                            "snap_unique_sellers": len(tc.get("unique_sellers", set())),
+                        }
 
                     stats["trades"] += 1
 
@@ -226,7 +293,7 @@ async def price_checker_loop(client: httpx.AsyncClient):
 
         for mint, token in list(tokens.items()):
             age_sec = now - token["created_ts"]
-            if age_sec > 2100:
+            if age_sec > 1200:
                 continue
             for minutes in PRICE_CHECK_MINUTES:
                 target_sec = minutes * 60
@@ -351,17 +418,38 @@ def finalize_tokens() -> list[dict]:
     for mint, token in tokens.items():
         tc = trade_counts.get(mint, {})
         t = dict(token)
-        t["total_buys"] = tc.get("buys", 0)
-        t["total_sells"] = tc.get("sells", 0)
-        t["total_buy_sol"] = round(tc.get("buy_sol", 0), 4)
-        t["total_sell_sol"] = round(tc.get("sell_sol", 0), 4)
-        t["buy_sell_ratio"] = round(tc.get("buys", 0) / max(1, tc.get("sells", 1)), 2)
-        t["sell_pressure"] = round(tc.get("sells", 0) / max(1, tc.get("buys", 0) + tc.get("sells", 0)) * 100, 1)
-        t["unique_buyers"] = len(tc.get("unique_buyers", set()))
-        t["unique_sellers"] = len(tc.get("unique_sellers", set()))
+
+        t["final_buys"] = tc.get("buys", 0)
+        t["final_sells"] = tc.get("sells", 0)
+        t["final_buy_sol"] = round(tc.get("buy_sol", 0), 4)
+        t["final_sell_sol"] = round(tc.get("sell_sol", 0), 4)
+
+        snap = token.get("snapshot_60s")
+        if snap:
+            t["total_buys"] = snap["snap_buys"]
+            t["total_sells"] = snap["snap_sells"]
+            t["total_buy_sol"] = snap["snap_buy_sol"]
+            t["total_sell_sol"] = snap["snap_sell_sol"]
+            t["v_sol_in_bonding"] = snap["snap_v_sol"]
+            t["v_tokens_in_bonding"] = snap["snap_v_tokens"]
+            t["buy_sell_ratio"] = snap["snap_ratio"]
+            t["sell_pressure"] = snap["snap_sell_pressure"]
+            t["unique_buyers"] = snap["snap_unique_buyers"]
+            t["unique_sellers"] = snap["snap_unique_sellers"]
+            t["snap_age"] = snap["snap_age"]
+        else:
+            t["total_buys"] = tc.get("buys", 0)
+            t["total_sells"] = tc.get("sells", 0)
+            t["total_buy_sol"] = round(tc.get("buy_sol", 0), 4)
+            t["total_sell_sol"] = round(tc.get("sell_sol", 0), 4)
+            t["buy_sell_ratio"] = round(tc.get("buys", 0) / max(1, tc.get("sells", 1)), 2)
+            t["sell_pressure"] = round(tc.get("sells", 0) / max(1, tc.get("buys", 0) + tc.get("sells", 0)) * 100, 1)
+            t["unique_buyers"] = len(tc.get("unique_buyers", set()))
+            t["unique_sellers"] = len(tc.get("unique_sellers", set()))
+            t["snap_age"] = None
 
         best_change = None
-        for key in ["change_30m", "change_20m", "change_10m", "change_5m", "change_1m"]:
+        for key in ["change_15m", "change_10m", "change_5m", "change_1m"]:
             if t.get(key) is not None:
                 if best_change is None or t[key] > best_change:
                     best_change = t[key]
@@ -376,18 +464,36 @@ def finalize_tokens() -> list[dict]:
 
         t["best_change_pct"] = round(best_change, 1) if best_change is not None else None
 
-        if best_change is None:
-            t["outcome"] = "no_data"
-        elif best_change >= ROCKET_THRESHOLD:
-            t["outcome"] = "ROCKET"
-        elif best_change >= WINNER_THRESHOLD:
-            t["outcome"] = "winner"
-        elif best_change >= 0:
-            t["outcome"] = "flat"
-        elif best_change >= -50:
-            t["outcome"] = "loser"
+        peak_bc = t.get("peak_bc_pnl")
+        latest_bc = t.get("latest_bc_pnl")
+        bc_pnl = peak_bc if peak_bc is not None else latest_bc
+
+        if bc_pnl is not None:
+            t["bc_peak_pnl"] = round(peak_bc, 1) if peak_bc is not None else None
+            t["bc_latest_pnl"] = round(latest_bc, 1) if latest_bc is not None else None
+            if bc_pnl >= 100:
+                t["outcome"] = "ROCKET"
+            elif bc_pnl >= 15:
+                t["outcome"] = "winner"
+            elif bc_pnl >= -10:
+                t["outcome"] = "flat"
+            elif bc_pnl >= -30:
+                t["outcome"] = "loser"
+            else:
+                t["outcome"] = "dead"
+        elif best_change is not None:
+            if best_change >= ROCKET_THRESHOLD:
+                t["outcome"] = "ROCKET"
+            elif best_change >= WINNER_THRESHOLD:
+                t["outcome"] = "winner"
+            elif best_change >= 0:
+                t["outcome"] = "flat"
+            elif best_change >= -50:
+                t["outcome"] = "loser"
+            else:
+                t["outcome"] = "dead"
         else:
-            t["outcome"] = "dead"
+            t["outcome"] = "no_data"
 
         result.append(t)
     return result
@@ -428,7 +534,7 @@ def save_data(tag: str = ""):
             "winners_count": len(winners),
             "rocket_threshold": f"+{ROCKET_THRESHOLD}%",
             "winner_threshold": f"+{WINNER_THRESHOLD}%",
-            "tracking_duration": "30 minutes per token",
+            "tracking_duration": "15 minutes per token",
             "price_check_intervals": PRICE_CHECK_MINUTES,
         },
         "tokens": finalized,
@@ -493,7 +599,7 @@ async def cleanup_old_subscriptions():
     while not shutdown:
         await asyncio.sleep(300)
         now = time.time()
-        old_mints = [m for m, t in tokens.items() if now - t["created_ts"] > 2400]
+        old_mints = [m for m, t in tokens.items() if now - t["created_ts"] > 1200]
         if old_mints:
             for mint in old_mints:
                 tc = trade_counts.get(mint)
@@ -509,7 +615,7 @@ async def main():
     log.info("=" * 70)
     log.info("6-HOUR AUTONOMOUS COLLECTOR")
     log.info("Duration: %d seconds (%.1f hours)", DURATION, DURATION / 3600)
-    log.info("Token tracking: 30 minutes per token")
+    log.info("Token tracking: 15 minutes per token")
     log.info("Price checks: %s minutes", PRICE_CHECK_MINUTES)
     log.info("ROCKET threshold: +%d%%", ROCKET_THRESHOLD)
     log.info("WINNER threshold: +%d%%", WINNER_THRESHOLD)
