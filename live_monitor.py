@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import sys
 import time
 import os
 from datetime import datetime, timezone
@@ -16,6 +17,9 @@ from config import (
     COLLECT_DURATION,
     DATA_DIR,
 )
+
+REAL_TRADING = "--real" in sys.argv
+trader = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,9 +44,13 @@ TIME_STOP_SEC = 120
 TIME_STOP_MIN_GAIN = 10.0
 TRAILING_STOP_PCT = 10.0
 TP_LADDER = [
-    {"level": 200.0, "sell_pct": 25},
-    {"level": 500.0, "sell_pct": 25},
+    {"level": 200.0, "sell_pct": 50},
+    {"level": 400.0, "sell_pct": 100},
 ]
+MAX_SELLS_PER_TOKEN = 3
+MIN_LIQUIDITY_USD = 1500.0
+MAX_SLOTS = int(os.getenv("MAX_SLOTS", "10"))
+BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "5.0"))
 
 tokens: dict[str, dict] = {}
 trade_counts: dict[str, dict] = {}
@@ -53,6 +61,17 @@ SOL_PRICE_USD = 200.0
 model = None
 scaler = None
 seen_mints: set[str] = set()
+
+
+def init_trader():
+    global trader
+    if not REAL_TRADING:
+        return
+    from real_trader import RealTrader
+    trader = RealTrader()
+    bal = trader.refresh_balance()
+    trader.initial_balance = bal
+    log.info("REAL TRADING MODE | Wallet: %s | Balance: %.4f SOL ($%.2f)", trader.pubkey, bal, bal * SOL_PRICE_USD)
 
 
 def load_model():
@@ -136,12 +155,21 @@ async def ml_scanner():
                     continue
                 seen_mints.add(mint)
 
+                if stats["signals"] >= MAX_SLOTS:
+                    log.info("SKIP %s %s: max slots %d reached", label, token["symbol"], MAX_SLOTS)
+                    continue
+
                 if buys < MIN_BUYS_FOR_SIGNAL:
                     log.info("SKIP %s %s: buys=%d < %d", label, token["symbol"], buys, MIN_BUYS_FOR_SIGNAL)
                     continue
                 ratio = token["buy_sell_ratio"]
                 if ratio < MIN_RATIO_FOR_SIGNAL:
                     log.info("SKIP %s %s: ratio=%.1f < %.1f", label, token["symbol"], ratio, MIN_RATIO_FOR_SIGNAL)
+                    continue
+
+                liq = token.get("dex_liquidity_usd", 0)
+                if liq < MIN_LIQUIDITY_USD and token.get("enriched"):
+                    log.info("SKIP %s %s: liquidity=$%.0f < $%.0f", label, token["symbol"], liq, MIN_LIQUIDITY_USD)
                     continue
 
                 signal_time = time.time()
@@ -173,6 +201,7 @@ async def ml_scanner():
                     "close_pnl_pct": None,
                     "close_time": None,
                     "checked_at": None,
+                    "sells_done": 0,
                 }
                 signals.append(signal)
                 stats["signals"] += 1
@@ -182,22 +211,48 @@ async def ml_scanner():
                     confidence, buys, token["buy_sell_ratio"],
                 )
 
+                if REAL_TRADING and trader:
+                    sol_amount = round(BET_SIZE_USD / SOL_PRICE_USD, 4)
+                    asyncio.create_task(execute_real_buy(signal, sol_amount))
+
 
 def check_tp_ladder(sig: dict, current_pnl: float):
+    sells_done = sig.get("sells_done", 0)
     for tp in TP_LADDER:
         level = tp["level"]
         sell_pct = tp["sell_pct"]
         if current_pnl >= level and level not in sig["tp_hits"]:
+            if sells_done >= MAX_SELLS_PER_TOKEN:
+                log.info("TP %s +%.0f%%: SKIP (max %d sells reached)", sig["symbol"], level, MAX_SELLS_PER_TOKEN)
+                continue
             remaining = sig["position_remaining_pct"]
-            sold_portion = remaining * (sell_pct / 100.0)
+            if sell_pct == 100:
+                sold_portion = remaining
+            else:
+                sold_portion = remaining * (sell_pct / 100.0)
             realized = sold_portion * (current_pnl / 100.0) / 100.0
             sig["realized_pnl"] += realized
             sig["position_remaining_pct"] = remaining - sold_portion
             sig["tp_hits"].append(level)
+            sig["sells_done"] = sells_done + 1
+            sells_done += 1
             log.info(
                 "TP HIT %s +%.0f%%: sold %.0f%% (%.1f%% remaining) | realized +$%.4f per $1",
                 sig["symbol"], level, sold_portion, sig["position_remaining_pct"], realized,
             )
+
+            if REAL_TRADING and trader:
+                real_sell_pct = 100 if sell_pct == 100 else sell_pct
+                asyncio.create_task(execute_real_sell(sig, real_sell_pct, f"TP+{level:.0f}%"))
+
+            if sig["position_remaining_pct"] <= 0:
+                sig["status"] = "CLOSED"
+                sig["close_reason"] = f"TP+{level:.0f}% FULL EXIT"
+                sig["close_pnl_pct"] = round(sig["realized_pnl"] * 100, 1)
+                sig["close_time"] = datetime.now(timezone.utc).isoformat()
+                sig["pnl_usd_per_dollar"] = round(1 + sig["realized_pnl"], 4)
+                log.info("CLOSED %s %s: FULL EXIT at TP+%.0f%% | P&L: +%.1f%%", sig["ml_label"], sig["symbol"], level, sig["realized_pnl"] * 100)
+                return
 
 
 def check_exit_rules(sig: dict, current_pnl: float) -> str | None:
@@ -234,6 +289,40 @@ def close_signal(sig: dict, reason: str, pnl: float):
         sig["ml_label"], sig["symbol"], reason,
         total_pnl_per_dollar * 100, sig["realized_pnl"] * 100, sig["position_remaining_pct"], pnl,
     )
+
+    sells_done = sig.get("sells_done", 0)
+    if REAL_TRADING and trader and sig.get("real_buy") and sig["position_remaining_pct"] > 0:
+        if sells_done < MAX_SELLS_PER_TOKEN:
+            sig["sells_done"] = sells_done + 1
+            asyncio.create_task(execute_real_sell(sig, 100, reason))
+
+
+async def execute_real_buy(sig: dict, sol_amount: float):
+    try:
+        result = await trader.buy_token(sig["mint"], sol_amount, sig["symbol"])
+        sig["real_buy"] = result
+        if result["success"]:
+            sig["real_buy_tx"] = result["tx_hash"]
+            sig["real_sol_spent"] = sol_amount
+            log.info("REAL BUY OK %s: %.4f SOL | tx=%s", sig["symbol"], sol_amount, result["tx_hash"][:20])
+        else:
+            log.error("REAL BUY FAILED %s: %s", sig["symbol"], result["error"])
+    except Exception as e:
+        log.error("REAL BUY ERROR %s: %s", sig["symbol"], e)
+
+
+async def execute_real_sell(sig: dict, sell_pct: int, reason: str):
+    try:
+        result = await trader.sell_token(sig["mint"], sell_pct, sig["symbol"], reason)
+        if result["success"]:
+            sol_got = result.get("sol_received", 0)
+            log.info("REAL SELL OK %s %d%% (%s): tx=%s | +%.6f SOL", sig["symbol"], sell_pct, reason, result["tx_hash"][:20], sol_got)
+        else:
+            log.error("REAL SELL FAILED %s (%s): %s", sig["symbol"], reason, result.get("error", "not confirmed"))
+        return result
+    except Exception as e:
+        log.error("REAL SELL ERROR %s: %s", sig["symbol"], e)
+        return {"success": False, "error": str(e)}
 
 
 async def signal_price_updater(client: httpx.AsyncClient):
@@ -537,9 +626,11 @@ async def report_printer():
 async def main():
     duration = COLLECT_DURATION
     log.info("=" * 60)
-    log.info("LIVE ML MONITOR v3")
+    mode_str = "REAL TRADING" if REAL_TRADING else "SIMULATION"
+    log.info("LIVE ML MONITOR v4 [%s]", mode_str)
     log.info("Duration: %d seconds", duration)
-    log.info("Filters: buys >= %d, ratio >= %.1f", MIN_BUYS_FOR_SIGNAL, MIN_RATIO_FOR_SIGNAL)
+    log.info("Bet size: $%.0f | Max slots: %d | Max sells/token: %d", BET_SIZE_USD, MAX_SLOTS, MAX_SELLS_PER_TOKEN)
+    log.info("Filters: buys >= %d, ratio >= %.1f, liquidity >= $%.0f", MIN_BUYS_FOR_SIGNAL, MIN_RATIO_FOR_SIGNAL, MIN_LIQUIDITY_USD)
     log.info("Stop-loss: %.0f%% | Time-stop: %ds (min +%.0f%%)", STOP_LOSS_PCT, TIME_STOP_SEC, TIME_STOP_MIN_GAIN)
     log.info("Trailing stop: -%.0f%% from peak (activates at +30%%)", TRAILING_STOP_PCT)
     log.info("TP Ladder: %s", ", ".join(f"+{tp['level']:.0f}%->sell {tp['sell_pct']}%%" for tp in TP_LADDER))
@@ -548,6 +639,12 @@ async def main():
     if not load_model():
         log.error("Cannot start without ML model. Run train_model.py first.")
         return
+
+    if REAL_TRADING:
+        init_trader()
+        if not trader:
+            log.error("Failed to init trader. Check SOLANA_PRIVATE_KEY in .env")
+            return
 
     stats["start"] = time.time()
 
@@ -582,6 +679,14 @@ async def main():
     filepath = save_session()
     report = print_signals_report()
     log.info("\n%s", report)
+
+    if REAL_TRADING and trader:
+        await asyncio.sleep(3)
+        final_bal = trader.get_sol_balance()
+        summary = trader.get_trade_summary()
+        log.info("WALLET: %.4f SOL ($%.2f) | initial: %.4f SOL", final_bal, final_bal * SOL_PRICE_USD, trader.initial_balance)
+        log.info("TRADES: %s", summary)
+
     log.info("DONE! Session: %s", filepath)
 
 
