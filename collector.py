@@ -12,7 +12,9 @@ from config import (
     PUMPPORTAL_WS_URL,
     DEXSCREENER_API,
     COLLECT_DURATION,
+    COOLDOWN_DURATION,
     DATA_DIR,
+    PRICE_SNAPSHOT_INTERVALS,
 )
 
 logging.basicConfig(
@@ -25,9 +27,20 @@ log = logging.getLogger("collector")
 tokens: dict[str, dict] = {}
 trade_counts: dict[str, dict] = {}
 migrations: set[str] = set()
-stats = {"total": 0, "enriched": 0, "migrated": 0, "errors": 0, "trades": 0, "start": 0}
+stats = {"total": 0, "enriched": 0, "migrated": 0, "trades": 0, "start": 0}
 
 SOL_PRICE_USD = 200.0
+collecting_active = True
+
+
+def bonding_curve_price_sol(v_sol: float, v_tokens: float) -> float:
+    if v_tokens <= 0:
+        return 0.0
+    return v_sol / v_tokens
+
+
+def bonding_curve_price_usd(v_sol: float, v_tokens: float) -> float:
+    return bonding_curve_price_sol(v_sol, v_tokens) * SOL_PRICE_USD
 
 
 async def fetch_sol_price(client: httpx.AsyncClient):
@@ -50,6 +63,58 @@ async def sol_price_updater(client: httpx.AsyncClient):
     while True:
         await asyncio.sleep(300)
         await fetch_sol_price(client)
+
+
+def take_snapshot(token: dict, label: str):
+    v_sol = token.get("v_sol_current", token.get("v_sol_in_bonding", 0))
+    v_tokens = token.get("v_tokens_current", token.get("v_tokens_in_bonding", 0))
+    price_sol = bonding_curve_price_sol(v_sol, v_tokens)
+    price_usd = price_sol * SOL_PRICE_USD
+    mcap_usd = token.get("latest_mcap_sol", token.get("market_cap_sol", 0)) * SOL_PRICE_USD
+
+    tc = trade_counts.get(token["mint"], {})
+
+    snap = {
+        "age_sec": int(time.time() - token["created_ts"]),
+        "price_sol": price_sol,
+        "price_usd": price_usd,
+        "v_sol": v_sol,
+        "v_tokens": v_tokens,
+        "mcap_usd": mcap_usd,
+        "buys": tc.get("buys", 0),
+        "sells": tc.get("sells", 0),
+        "buy_sol": round(tc.get("buy_sol", 0), 4),
+        "sell_sol": round(tc.get("sell_sol", 0), 4),
+        "unique_buyers": len(tc.get("buyers", set())),
+        "unique_sellers": len(tc.get("sellers", set())),
+    }
+
+    if "snapshots" not in token:
+        token["snapshots"] = {}
+    token["snapshots"][label] = snap
+
+    initial_price = token.get("initial_price_usd", 0)
+    if initial_price > 0 and price_usd > 0:
+        change_pct = ((price_usd - initial_price) / initial_price) * 100
+        token[f"change_{label}"] = round(change_pct, 1)
+    elif price_usd == 0:
+        token[f"change_{label}"] = -100.0
+
+    if price_usd > token.get("peak_price_usd", 0):
+        token["peak_price_usd"] = price_usd
+        token["peak_price_age_sec"] = snap["age_sec"]
+
+
+async def snapshot_scheduler():
+    while True:
+        await asyncio.sleep(1)
+        now = time.time()
+        for mint, token in list(tokens.items()):
+            age = now - token["created_ts"]
+            for interval in PRICE_SNAPSHOT_INTERVALS:
+                label = f"{interval}s"
+                if age >= interval and label not in token.get("snapshots", {}):
+                    take_snapshot(token, label)
 
 
 async def enrich_batch(client: httpx.AsyncClient):
@@ -78,8 +143,6 @@ async def enrich_batch(client: httpx.AsyncClient):
                     continue
                 p = pairs[0]
                 token = tokens[mint]
-                price_usd = float(p.get("priceUsd") or 0)
-                token["dex_price_usd"] = price_usd
                 token["dex_liquidity_usd"] = float((p.get("liquidity") or {}).get("usd") or 0)
                 token["dex_volume_5m"] = float((p.get("volume") or {}).get("m5") or 0)
                 token["dex_volume_1h"] = float((p.get("volume") or {}).get("h1") or 0)
@@ -89,71 +152,15 @@ async def enrich_batch(client: httpx.AsyncClient):
                 token["dex_sells_1h"] = int((p.get("txns") or {}).get("h1", {}).get("sells") or 0)
                 token["dex_market_cap"] = float(p.get("marketCap") or 0)
                 token["dex_fdv"] = float(p.get("fdv") or 0)
-                token["dex_change_5m"] = float((p.get("priceChange") or {}).get("m5") or 0)
-                token["dex_change_1h"] = float((p.get("priceChange") or {}).get("h1") or 0)
-                token["dex_dex_id"] = p.get("dexId", "")
                 info = p.get("info", {}) or {}
                 token["has_website"] = len(info.get("websites", [])) > 0
                 token["has_socials"] = len(info.get("socials", [])) > 0
-
-                if price_usd > 0 and token["initial_price_usd"] > 0:
-                    change = ((price_usd - token["initial_price_usd"]) / token["initial_price_usd"]) * 100
-                    token["change_at_enrich"] = round(change, 1)
 
                 token["enriched"] = True
                 stats["enriched"] += 1
                 await asyncio.sleep(1.1)
             except Exception as e:
-                stats["errors"] += 1
                 log.debug("Enrich error %s: %s", mint[:8], e)
-
-
-async def price_checker(client: httpx.AsyncClient):
-    while True:
-        await asyncio.sleep(20)
-        now = time.time()
-        batch = []
-        for mint, token in list(tokens.items()):
-            age = now - token["created_ts"]
-            if age >= 300 and not token.get("price_5m"):
-                batch.append((mint, 5))
-            elif age >= 600 and not token.get("price_10m"):
-                batch.append((mint, 10))
-            if len(batch) >= 8:
-                break
-
-        for mint, minutes in batch:
-            try:
-                r = await client.get(
-                    f"{DEXSCREENER_API}/tokens/v1/solana/{mint}",
-                    timeout=10,
-                )
-                if r.status_code != 200:
-                    continue
-                pairs = r.json()
-                if not pairs or not isinstance(pairs, list) or len(pairs) == 0:
-                    token = tokens[mint]
-                    token[f"price_{minutes}m"] = 0
-                    token[f"change_{minutes}m"] = -100.0
-                    continue
-                price = float(pairs[0].get("priceUsd") or 0)
-                token = tokens[mint]
-                token[f"price_{minutes}m"] = price
-                initial = token["initial_price_usd"]
-                if initial > 0 and price > 0:
-                    change = ((price - initial) / initial) * 100
-                    token[f"change_{minutes}m"] = round(change, 1)
-                elif price == 0:
-                    token[f"change_{minutes}m"] = -100.0
-                liq = float((pairs[0].get("liquidity") or {}).get("usd") or 0)
-                buys = int((pairs[0].get("txns") or {}).get("m5", {}).get("buys") or 0)
-                sells = int((pairs[0].get("txns") or {}).get("m5", {}).get("sells") or 0)
-                token[f"liq_{minutes}m"] = liq
-                token[f"buys_{minutes}m"] = buys
-                token[f"sells_{minutes}m"] = sells
-                await asyncio.sleep(1.1)
-            except Exception:
-                pass
 
 
 async def listen_pumpportal():
@@ -179,13 +186,21 @@ async def listen_pumpportal():
                         migrations.add(mint)
                         tokens[mint]["migrated"] = True
                         tokens[mint]["migrated_at"] = time.time()
-                        tokens[mint]["migration_age_sec"] = int(time.time() - tokens[mint]["created_ts"])
+                        tokens[mint]["migration_age_sec"] = int(
+                            time.time() - tokens[mint]["created_ts"]
+                        )
                         stats["migrated"] += 1
                         sym = tokens[mint]["symbol"]
-                        log.info("MIGRATED: %s (%s) after %ds", sym, mint[:8], tokens[mint]["migration_age_sec"])
+                        log.info(
+                            "MIGRATED: %s (%s) after %ds",
+                            sym, mint[:8], tokens[mint]["migration_age_sec"],
+                        )
                     continue
 
                 if msg.get("txType") == "create":
+                    if not collecting_active:
+                        continue
+
                     mint = msg.get("mint", "")
                     if not mint or mint in tokens:
                         continue
@@ -198,9 +213,13 @@ async def listen_pumpportal():
                     v_sol = float(msg.get("vSolInBondingCurve") or 0)
                     v_tokens = float(msg.get("vTokensInBondingCurve") or 0)
                     mcap_sol = float(msg.get("marketCapSol") or 0)
-                    init_buy = float(msg.get("initialBuy") or 0) / 1e9 if msg.get("initialBuy") else 0
+                    init_buy = (
+                        float(msg.get("initialBuy") or 0) / 1e9
+                        if msg.get("initialBuy")
+                        else 0
+                    )
 
-                    price_sol = v_sol / v_tokens if v_tokens > 0 else 0
+                    price_sol = bonding_curve_price_sol(v_sol, v_tokens)
                     price_usd = price_sol * SOL_PRICE_USD
                     mcap_usd = mcap_sol * SOL_PRICE_USD
 
@@ -218,13 +237,18 @@ async def listen_pumpportal():
                         "market_cap_sol": mcap_sol,
                         "v_tokens_in_bonding": v_tokens,
                         "v_sol_in_bonding": v_sol,
+                        "v_sol_current": v_sol,
+                        "v_tokens_current": v_tokens,
+                        "latest_mcap_sol": mcap_sol,
+                        "latest_mcap_usd": mcap_usd,
+                        "peak_price_usd": price_usd,
+                        "peak_price_age_sec": 0,
                         "dev_address": msg.get("traderPublicKey", ""),
                         "migrated": False,
                         "migrated_at": None,
                         "migration_age_sec": None,
                         "enriched": False,
                         "enrich_tried": False,
-                        "dex_price_usd": 0,
                         "dex_liquidity_usd": 0,
                         "dex_volume_5m": 0,
                         "dex_volume_1h": 0,
@@ -234,32 +258,25 @@ async def listen_pumpportal():
                         "dex_sells_1h": 0,
                         "dex_market_cap": 0,
                         "dex_fdv": 0,
-                        "dex_change_5m": 0,
-                        "dex_change_1h": 0,
-                        "dex_dex_id": "",
                         "has_website": False,
                         "has_socials": False,
-                        "change_at_enrich": None,
-                        "price_5m": None,
-                        "price_10m": None,
-                        "change_5m": None,
-                        "change_10m": None,
-                        "liq_5m": None,
-                        "liq_10m": None,
-                        "buys_5m": None,
-                        "sells_5m": None,
-                        "buys_10m": None,
-                        "sells_10m": None,
+                        "snapshots": {},
                         "outcome": "unknown",
                     }
 
-                    trade_counts[mint] = {"buys": 0, "sells": 0, "buy_sol": 0, "sell_sol": 0}
+                    trade_counts[mint] = {
+                        "buys": 0,
+                        "sells": 0,
+                        "buy_sol": 0,
+                        "sell_sol": 0,
+                        "buyers": set(),
+                        "sellers": set(),
+                    }
 
                     stats["total"] += 1
                     log.info(
-                        "[%ds] #%d NEW: %s | mcap=$%.0f buy=%.3f SOL",
-                        elapsed, stats["total"], symbol,
-                        mcap_usd, init_buy,
+                        "[%ds] #%d NEW: %s | mcap=$%.0f buy=%.3f SOL price=$%.10f",
+                        elapsed, stats["total"], symbol, mcap_usd, init_buy, price_usd,
                     )
 
                     await ws.send(json.dumps({
@@ -269,23 +286,43 @@ async def listen_pumpportal():
 
                 elif msg.get("txType") in ("buy", "sell"):
                     mint = msg.get("mint", "")
-                    if mint in trade_counts:
-                        tx = msg["txType"]
-                        sol_amount = float(msg.get("solAmount") or 0)
-                        tc = trade_counts[mint]
-                        if tx == "buy":
-                            tc["buys"] += 1
-                            tc["buy_sol"] += sol_amount
-                        else:
-                            tc["sells"] += 1
-                            tc["sell_sol"] += sol_amount
+                    if mint not in trade_counts:
+                        continue
 
-                        new_mcap = float(msg.get("marketCapSol") or 0)
-                        if new_mcap > 0:
-                            tokens[mint]["latest_mcap_sol"] = new_mcap
-                            tokens[mint]["latest_mcap_usd"] = new_mcap * SOL_PRICE_USD
+                    tx = msg["txType"]
+                    sol_amount = float(msg.get("solAmount") or 0)
+                    trader_key = msg.get("traderPublicKey", "")
+                    tc = trade_counts[mint]
 
-                        stats["trades"] += 1
+                    if tx == "buy":
+                        tc["buys"] += 1
+                        tc["buy_sol"] += sol_amount
+                        tc["buyers"].add(trader_key)
+                    else:
+                        tc["sells"] += 1
+                        tc["sell_sol"] += sol_amount
+                        tc["sellers"].add(trader_key)
+
+                    new_v_sol = float(msg.get("vSolInBondingCurve") or 0)
+                    new_v_tokens = float(msg.get("vTokensInBondingCurve") or 0)
+                    new_mcap_sol = float(msg.get("marketCapSol") or 0)
+
+                    if new_v_sol > 0 and new_v_tokens > 0:
+                        tokens[mint]["v_sol_current"] = new_v_sol
+                        tokens[mint]["v_tokens_current"] = new_v_tokens
+
+                        price_usd = bonding_curve_price_usd(new_v_sol, new_v_tokens)
+                        if price_usd > tokens[mint].get("peak_price_usd", 0):
+                            tokens[mint]["peak_price_usd"] = price_usd
+                            tokens[mint]["peak_price_age_sec"] = int(
+                                time.time() - tokens[mint]["created_ts"]
+                            )
+
+                    if new_mcap_sol > 0:
+                        tokens[mint]["latest_mcap_sol"] = new_mcap_sol
+                        tokens[mint]["latest_mcap_usd"] = new_mcap_sol * SOL_PRICE_USD
+
+                    stats["trades"] += 1
 
         except websockets.exceptions.ConnectionClosed:
             log.warning("PumpPortal disconnected, reconnecting in 3s...")
@@ -308,25 +345,47 @@ def finalize_tokens():
         token["total_sells"] = tc.get("sells", 0)
         token["total_buy_sol"] = round(tc.get("buy_sol", 0), 4)
         token["total_sell_sol"] = round(tc.get("sell_sol", 0), 4)
-        token["buy_sell_ratio"] = round(tc.get("buys", 0) / max(1, tc.get("sells", 1)), 2)
-        token["sell_pressure"] = round(tc.get("sells", 0) / max(1, tc.get("buys", 1) + tc.get("sells", 0)) * 100, 1)
+        token["unique_buyers"] = len(tc.get("buyers", set()))
+        token["unique_sellers"] = len(tc.get("sellers", set()))
 
-        best_change = None
-        for key in ["change_10m", "change_5m", "change_at_enrich"]:
-            if token.get(key) is not None:
-                best_change = token[key]
-                break
+        buys = tc.get("buys", 0)
+        sells = tc.get("sells", 0)
+        token["buy_sell_ratio"] = round(buys / max(1, sells), 2)
+        token["sell_pressure"] = round(sells / max(1, buys + sells) * 100, 1)
 
-        latest_mcap = token.get("latest_mcap_usd", 0)
-        initial_mcap = token.get("initial_mcap_usd", 0)
-        if best_change is None and latest_mcap > 0 and initial_mcap > 0:
-            best_change = ((latest_mcap - initial_mcap) / initial_mcap) * 100
+        initial_price = token.get("initial_price_usd", 0)
+        v_sol = token.get("v_sol_current", token.get("v_sol_in_bonding", 0))
+        v_tokens = token.get("v_tokens_current", token.get("v_tokens_in_bonding", 0))
+        final_price = bonding_curve_price_usd(v_sol, v_tokens)
+        token["final_price_usd"] = final_price
 
-        token["best_change_pct"] = round(best_change, 1) if best_change is not None else None
+        peak_price = token.get("peak_price_usd", initial_price)
 
-        if best_change is None:
-            token["outcome"] = "no_data"
-        elif best_change >= 100:
+        if initial_price > 0 and peak_price > 0:
+            peak_change = ((peak_price - initial_price) / initial_price) * 100
+        else:
+            peak_change = 0.0
+        token["peak_change_pct"] = round(peak_change, 1)
+
+        if initial_price > 0 and final_price > 0:
+            final_change = ((final_price - initial_price) / initial_price) * 100
+        else:
+            final_change = -100.0
+        token["final_change_pct"] = round(final_change, 1)
+
+        best_change = peak_change
+
+        snapshots = token.get("snapshots", {})
+        for label, snap in snapshots.items():
+            snap_price = snap.get("price_usd", 0)
+            if initial_price > 0 and snap_price > 0:
+                change = ((snap_price - initial_price) / initial_price) * 100
+                if change > best_change:
+                    best_change = change
+
+        token["best_change_pct"] = round(best_change, 1)
+
+        if best_change >= 100:
             token["outcome"] = "ROCKET"
         elif best_change >= 25:
             token["outcome"] = "winner"
@@ -338,11 +397,11 @@ def finalize_tokens():
             token["outcome"] = "dead"
 
 
-def save_data():
+def save_data(tag: str = "FINAL") -> str:
     finalize_tokens()
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    filepath = os.path.join(DATA_DIR, f"tokens_{ts}.json")
+    filepath = os.path.join(DATA_DIR, f"collect_{tag}_{ts}.json")
 
     outcomes: dict[str, int] = {}
     for t in tokens.values():
@@ -350,21 +409,36 @@ def save_data():
         outcomes[o] = outcomes.get(o, 0) + 1
 
     duration = time.time() - stats["start"]
+
+    serializable_tokens = []
+    for t in tokens.values():
+        token_copy = dict(t)
+        tc = trade_counts.get(t["mint"], {})
+        if "buyers" in tc:
+            token_copy["unique_buyer_addresses"] = list(tc["buyers"])[:50]
+        if "sellers" in tc:
+            token_copy["unique_seller_addresses"] = list(tc["sellers"])[:50]
+        serializable_tokens.append(token_copy)
+
     output = {
         "meta": {
-            "start_time": datetime.fromtimestamp(stats["start"], tz=timezone.utc).isoformat(),
+            "start_time": datetime.fromtimestamp(
+                stats["start"], tz=timezone.utc
+            ).isoformat(),
             "end_time": datetime.now(timezone.utc).isoformat(),
             "duration_sec": int(duration),
+            "collect_duration": COLLECT_DURATION,
+            "cooldown_duration": COOLDOWN_DURATION,
             "sol_price_usd": SOL_PRICE_USD,
             "total_tokens": stats["total"],
             "enriched": stats["enriched"],
             "migrated": stats["migrated"],
             "total_trades_tracked": stats["trades"],
-            "errors": stats["errors"],
             "tokens_per_min": round(stats["total"] / max(1, duration / 60), 1),
             "outcomes": outcomes,
+            "price_source": "pumpfun_bonding_curve",
         },
-        "tokens": list(tokens.values()),
+        "tokens": serializable_tokens,
     }
 
     with open(filepath, "w") as f:
@@ -373,8 +447,10 @@ def save_data():
     log.info("=" * 60)
     log.info("SAVED %d tokens to %s", len(tokens), filepath)
     log.info("Rate: %.1f tokens/min", output["meta"]["tokens_per_min"])
-    log.info("Enriched: %d | Migrated: %d | Trades tracked: %d",
-             stats["enriched"], stats["migrated"], stats["trades"])
+    log.info(
+        "Enriched: %d | Migrated: %d | Trades tracked: %d",
+        stats["enriched"], stats["migrated"], stats["trades"],
+    )
     log.info("Outcomes: %s", outcomes)
     log.info("=" * 60)
 
@@ -386,61 +462,27 @@ async def stats_printer():
         await asyncio.sleep(60)
         elapsed = int(time.time() - stats["start"])
         tpm = stats["total"] / max(1, elapsed / 60)
+        active_str = "COLLECTING" if collecting_active else "COOLDOWN"
         log.info(
-            "=== [%ds] tokens=%d enriched=%d migrated=%d trades=%d rate=%.1f/min ===",
-            elapsed, stats["total"], stats["enriched"], stats["migrated"],
+            "=== [%ds] [%s] tokens=%d enriched=%d migrated=%d trades=%d rate=%.1f/min ===",
+            elapsed, active_str, stats["total"], stats["enriched"], stats["migrated"],
             stats["trades"], tpm,
         )
 
 
-async def final_price_check(client: httpx.AsyncClient):
-    now = time.time()
-    pending = [m for m, t in tokens.items()
-               if not t.get("price_5m") and now - t["created_ts"] >= 300]
-    log.info("Final price check for %d tokens...", len(pending))
-    for i, mint in enumerate(pending):
-        try:
-            r = await client.get(
-                f"{DEXSCREENER_API}/tokens/v1/solana/{mint}",
-                timeout=10,
-            )
-            if r.status_code != 200:
-                continue
-            pairs = r.json()
-            token = tokens[mint]
-            age = now - token["created_ts"]
-            minutes = 10 if age >= 600 else 5
-
-            if not pairs or not isinstance(pairs, list) or len(pairs) == 0:
-                token[f"price_{minutes}m"] = 0
-                token[f"change_{minutes}m"] = -100.0
-                continue
-
-            price = float(pairs[0].get("priceUsd") or 0)
-            token[f"price_{minutes}m"] = price
-            initial = token["initial_price_usd"]
-            if initial > 0 and price > 0:
-                change = ((price - initial) / initial) * 100
-                token[f"change_{minutes}m"] = round(change, 1)
-            elif price == 0:
-                token[f"change_{minutes}m"] = -100.0
-
-            liq = float((pairs[0].get("liquidity") or {}).get("usd") or 0)
-            token[f"liq_{minutes}m"] = liq
-
-            if i % 5 == 4:
-                await asyncio.sleep(1.1)
-        except Exception:
-            pass
-
-
 async def main():
-    duration = COLLECT_DURATION
+    global collecting_active
+
+    total_duration = COLLECT_DURATION + COOLDOWN_DURATION
     log.info("=" * 60)
-    log.info("HIGH-THROUGHPUT COLLECTOR")
-    log.info("Duration: %d seconds", duration)
-    log.info("Sources: PumpPortal WS (new tokens + trades + migrations)")
-    log.info("Enrichment: DexScreener API (delayed 2min)")
+    log.info("SOLANA SNIPER DATA COLLECTOR V2")
+    log.info(
+        "Collection: %d sec | Cooldown: %d sec | Total: %d sec",
+        COLLECT_DURATION, COOLDOWN_DURATION, total_duration,
+    )
+    log.info("Price source: PumpFun bonding curve ONLY")
+    log.info("Enrichment: DexScreener (liquidity/volume only)")
+    log.info("Snapshot intervals: %s", PRICE_SNAPSHOT_INTERVALS)
     log.info("=" * 60)
     stats["start"] = time.time()
 
@@ -449,24 +491,30 @@ async def main():
 
         listener = asyncio.create_task(listen_pumpportal())
         enricher = asyncio.create_task(enrich_batch(client))
-        checker = asyncio.create_task(price_checker(client))
+        snapshotter = asyncio.create_task(snapshot_scheduler())
         printer = asyncio.create_task(stats_printer())
         sol_updater = asyncio.create_task(sol_price_updater(client))
 
-        await asyncio.sleep(duration)
+        log.info("Phase 1: COLLECTING new tokens for %d seconds...", COLLECT_DURATION)
+        await asyncio.sleep(COLLECT_DURATION)
 
-        log.info("Collection period ended. Final checks...")
+        collecting_active = False
+        log.info(
+            "Phase 2: COOLDOWN - no new tokens, tracking existing for %d seconds...",
+            COOLDOWN_DURATION,
+        )
+        log.info("Tokens collected: %d, now waiting for late data...", stats["total"])
+        await asyncio.sleep(COOLDOWN_DURATION)
+
+        log.info("Session complete. Finalizing...")
         listener.cancel()
         printer.cancel()
-
-        await final_price_check(client)
-
+        snapshotter.cancel()
         enricher.cancel()
-        checker.cancel()
         sol_updater.cancel()
 
     filepath = save_data()
-    log.info("DONE! Data: %s", filepath)
+    log.info("DONE! Data saved to: %s", filepath)
     return filepath
 
 

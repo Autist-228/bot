@@ -1,0 +1,38 @@
+{
+  "trained_at": "2026-02-10T20:25:48.376406+00:00",
+  "model_type": "rf",
+  "n_samples": 630,
+  "n_features": 25,
+  "features": [
+    "initial_buy_sol",
+    "initial_price_usd",
+    "initial_mcap_usd",
+    "v_sol_in_bonding",
+    "v_tokens_in_bonding",
+    "total_buys",
+    "total_sells",
+    "total_buy_sol",
+    "total_sell_sol",
+    "buy_sell_ratio",
+    "sell_pressure",
+    "unique_buyers",
+    "unique_sellers",
+    "dex_liquidity_usd",
+    "dex_volume_5m",
+    "dex_volume_1h",
+    "dex_buys_5m",
+    "dex_sells_5m",
+    "dex_buys_1h",
+    "dex_sells_1h",
+    "dex_market_cap",
+    "dex_fdv",
+    "has_website",
+    "has_socials",
+    "migrated"
+  ],
+  "label_map": {
+    "2": "ROCKET",
+    "1": "winner",
+    "0": "dead"
+  }
+}

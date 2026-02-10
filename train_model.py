@@ -22,9 +22,8 @@ FEATURES = [
     "initial_buy_sol",
     "initial_price_usd",
     "initial_mcap_usd",
-    "initial_v_sol",
-    "initial_v_tokens",
     "v_sol_in_bonding",
+    "v_tokens_in_bonding",
     "total_buys",
     "total_sells",
     "total_buy_sol",
@@ -42,8 +41,6 @@ FEATURES = [
     "dex_sells_1h",
     "dex_market_cap",
     "dex_fdv",
-    "dex_change_5m",
-    "dex_change_1h",
     "has_website",
     "has_socials",
     "migrated",
@@ -60,9 +57,8 @@ LABEL_MAP = {
 
 def load_data(data_dir: str | None = None) -> pd.DataFrame:
     directory = data_dir or DATA_DIR
-    files = sorted(glob.glob(os.path.join(directory, "tokens_*.json")))
-    files += sorted(glob.glob(os.path.join(directory, "collect6h_FINAL_*.json")))
-    files += sorted(glob.glob(os.path.join(directory, "collect6h_inc*_*.json")))
+    files = sorted(glob.glob(os.path.join(directory, "collect_*.json")))
+    files += sorted(glob.glob(os.path.join(directory, "*.jsonl")))
     if not files:
         log.error("No data files found in %s", directory)
         sys.exit(1)
@@ -70,24 +66,32 @@ def load_data(data_dir: str | None = None) -> pd.DataFrame:
     all_tokens = []
     for fp in files:
         with open(fp) as f:
-            data = json.load(f)
-        tokens = data.get("tokens", [])
-        log.info("Loaded %d tokens from %s", len(tokens), os.path.basename(fp))
-        all_tokens.extend(tokens)
+            if fp.endswith(".jsonl"):
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    tokens = data.get("tokens", [])
+                    log.info("Loaded %d tokens from %s", len(tokens), os.path.basename(fp))
+                    all_tokens.extend(tokens)
+            else:
+                data = json.load(f)
+                tokens = data.get("tokens", [])
+                log.info("Loaded %d tokens from %s", len(tokens), os.path.basename(fp))
+                all_tokens.extend(tokens)
 
     log.info("Total tokens loaded: %d", len(all_tokens))
 
     df = pd.DataFrame(all_tokens)
 
-    has_bc = df["bc_peak_pnl"].notna().sum() if "bc_peak_pnl" in df.columns else 0
-    log.info("Tokens with bonding curve P&L: %d / %d", has_bc, len(df))
-
     df = df[df["outcome"].isin(LABEL_MAP.keys())].copy()
     log.info("Tokens with valid outcome: %d", len(df))
 
-    before_snap = len(df)
-    df = df[df["snap_age"].notna()].copy() if "snap_age" in df.columns else df
-    log.info("Tokens with 60s snapshot: %d / %d (filtered out %d without snapshot)", len(df), before_snap, before_snap - len(df))
+    if "total_buys" in df.columns:
+        before = len(df)
+        df = df[df["total_buys"] >= 1].copy()
+        log.info("Tokens with at least 1 buy: %d / %d", len(df), before)
 
     df["label"]= df["outcome"].map(LABEL_MAP)
 

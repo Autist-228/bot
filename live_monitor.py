@@ -14,8 +14,19 @@ import joblib
 from config import (
     PUMPPORTAL_WS_URL,
     DEXSCREENER_API,
-    COLLECT_DURATION,
     DATA_DIR,
+    MIN_LIQUIDITY_USD,
+    BET_SIZE_USD,
+    MAX_SLOTS,
+    PUMPFUN_FEE_PCT,
+    BUY_SLIPPAGE_PCT,
+    SELL_SLIPPAGE_PCT,
+    STOP_LOSS_PCT,
+    TRAILING_STOP_PCT,
+    TIME_STOP_SEC,
+    TIME_STOP_MIN_GAIN,
+    MIN_CONFIDENCE_PCT,
+    ROCKET_ONLY,
 )
 
 REAL_TRADING = "--real" in sys.argv
@@ -30,32 +41,19 @@ log = logging.getLogger("live_monitor")
 
 FEATURES = [
     "initial_buy_sol", "initial_price_usd", "initial_mcap_usd",
-    "initial_v_sol", "initial_v_tokens",
-    "v_sol_in_bonding", "total_buys", "total_sells", "total_buy_sol", "total_sell_sol",
+    "v_sol_in_bonding", "v_tokens_in_bonding",
+    "total_buys", "total_sells", "total_buy_sol", "total_sell_sol",
     "buy_sell_ratio", "sell_pressure", "unique_buyers", "unique_sellers",
     "dex_liquidity_usd", "dex_volume_5m",
     "dex_volume_1h", "dex_buys_5m", "dex_sells_5m", "dex_buys_1h", "dex_sells_1h",
-    "dex_market_cap", "dex_fdv", "dex_change_5m", "dex_change_1h",
+    "dex_market_cap", "dex_fdv",
     "has_website", "has_socials", "migrated",
 ]
 
 MIN_BUYS_FOR_SIGNAL = 5
 MAX_BUYS_FOR_SIGNAL = 999
-MIN_RATIO_FOR_SIGNAL = 0.0
-MIN_CONFIDENCE_PCT = 70.0
-ROCKET_ONLY = True
-STOP_LOSS_PCT = -10.0
-TIME_STOP_SEC = 60
-TIME_STOP_MIN_GAIN = 10.0
-TRAILING_STOP_PCT = 15.0
 PRICE_POLL_INTERVAL = 0.5
 MAX_SELLS_PER_TOKEN = 1
-MIN_LIQUIDITY_USD = 2000.0
-MAX_SLOTS = int(os.getenv("MAX_SLOTS", "10"))
-BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "5.0"))
-BUY_SLIPPAGE_SIM = 0.02
-SELL_SLIPPAGE_SIM = 0.03
-PUMPFUN_FEE_PCT = 0.01
 
 tokens: dict[str, dict] = {}
 trade_counts: dict[str, dict] = {}
@@ -68,6 +66,16 @@ scaler = None
 seen_mints: set[str] = set()
 
 
+def bonding_curve_price_sol(v_sol: float, v_tokens: float) -> float:
+    if v_tokens <= 0:
+        return 0.0
+    return v_sol / v_tokens
+
+
+def bonding_curve_price_usd(v_sol: float, v_tokens: float) -> float:
+    return bonding_curve_price_sol(v_sol, v_tokens) * SOL_PRICE_USD
+
+
 def init_trader():
     global trader
     if not REAL_TRADING:
@@ -76,7 +84,10 @@ def init_trader():
     trader = RealTrader()
     bal = trader.refresh_balance()
     trader.initial_balance = bal
-    log.info("REAL TRADING MODE | Wallet: %s | Balance: %.4f SOL ($%.2f)", trader.pubkey, bal, bal * SOL_PRICE_USD)
+    log.info(
+        "REAL TRADING MODE | Wallet: %s | Balance: %.4f SOL ($%.2f)",
+        trader.pubkey, bal, bal * SOL_PRICE_USD,
+    )
 
 
 def load_model():
@@ -126,7 +137,74 @@ async def fetch_sol_price(client: httpx.AsyncClient):
         log.warning("Failed to fetch SOL price: %s", e)
 
 
-async def ml_scanner():
+async def enrich_token(client: httpx.AsyncClient, mint: str):
+    try:
+        r = await client.get(
+            f"{DEXSCREENER_API}/tokens/v1/solana/{mint}",
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return
+        pairs = r.json()
+        if not pairs or not isinstance(pairs, list) or len(pairs) == 0:
+            return
+        p = pairs[0]
+        token = tokens[mint]
+        token["dex_liquidity_usd"] = float((p.get("liquidity") or {}).get("usd") or 0)
+        token["dex_volume_5m"] = float((p.get("volume") or {}).get("m5") or 0)
+        token["dex_volume_1h"] = float((p.get("volume") or {}).get("h1") or 0)
+        token["dex_buys_5m"] = int((p.get("txns") or {}).get("m5", {}).get("buys") or 0)
+        token["dex_sells_5m"] = int((p.get("txns") or {}).get("m5", {}).get("sells") or 0)
+        token["dex_buys_1h"] = int((p.get("txns") or {}).get("h1", {}).get("buys") or 0)
+        token["dex_sells_1h"] = int((p.get("txns") or {}).get("h1", {}).get("sells") or 0)
+        token["dex_market_cap"] = float(p.get("marketCap") or 0)
+        token["dex_fdv"] = float(p.get("fdv") or 0)
+        info = p.get("info", {}) or {}
+        token["has_website"] = len(info.get("websites", [])) > 0
+        token["has_socials"] = len(info.get("socials", [])) > 0
+        token["enriched"] = True
+        stats["enriched"] += 1
+    except Exception:
+        pass
+
+
+async def enrich_batch(client: httpx.AsyncClient):
+    while True:
+        await asyncio.sleep(15)
+        now = time.time()
+        to_enrich = []
+        for mint, token in list(tokens.items()):
+            age = now - token["created_ts"]
+            if age >= 60 and not token.get("enriched") and not token.get("enrich_tried"):
+                to_enrich.append(mint)
+            if len(to_enrich) >= 5:
+                break
+        for mint in to_enrich:
+            tokens[mint]["enrich_tried"] = True
+            await enrich_token(client, mint)
+            await asyncio.sleep(1.1)
+
+
+def calc_bonding_curve_pnl(sig: dict, token_data: dict) -> float | None:
+    sim_tokens = sig.get("sim_tokens_bought", 0)
+    sim_sol_spent = sig.get("sim_sol_spent", 0)
+    if sim_tokens <= 0 or sim_sol_spent <= 0:
+        return None
+    cur_v_sol = token_data.get("v_sol_in_bonding", 0)
+    cur_v_tokens = token_data.get("v_tokens_in_bonding", 0)
+    if cur_v_sol <= 0 or cur_v_tokens <= 0:
+        return None
+    k = cur_v_sol * cur_v_tokens
+    new_v_tokens = cur_v_tokens + sim_tokens
+    new_v_sol = k / new_v_tokens
+    gross_sol_out = cur_v_sol - new_v_sol
+    sol_after_fee = gross_sol_out * (1 - PUMPFUN_FEE_PCT)
+    sol_after_slippage = sol_after_fee * (1 - SELL_SLIPPAGE_PCT)
+    pnl_pct = ((sol_after_slippage / sim_sol_spent) - 1) * 100
+    return pnl_pct
+
+
+async def ml_scanner(client: httpx.AsyncClient):
     while True:
         await asyncio.sleep(5)
         now = time.time()
@@ -164,7 +242,10 @@ async def ml_scanner():
                 if ROCKET_ONLY and label != "ROCKET":
                     continue
                 if confidence < MIN_CONFIDENCE_PCT:
-                    log.info("SKIP %s %s: conf=%.0f%% < %.0f%%", label, token["symbol"], confidence, MIN_CONFIDENCE_PCT)
+                    log.info(
+                        "SKIP %s %s: conf=%.0f%% < %.0f%%",
+                        label, token["symbol"], confidence, MIN_CONFIDENCE_PCT,
+                    )
                     continue
                 if mint in seen_mints:
                     continue
@@ -172,21 +253,22 @@ async def ml_scanner():
 
                 active_count = sum(1 for s in signals if s["status"] == "ACTIVE")
                 if active_count >= MAX_SLOTS:
-                    log.info("SKIP %s %s: %d/%d active slots full", label, token["symbol"], active_count, MAX_SLOTS)
-                    continue
-
-                if buys < MIN_BUYS_FOR_SIGNAL or buys > MAX_BUYS_FOR_SIGNAL:
-                    log.info("SKIP %s %s: buys=%d (range %d-%d)", label, token["symbol"], buys, MIN_BUYS_FOR_SIGNAL, MAX_BUYS_FOR_SIGNAL)
-                    continue
-                ratio = token["buy_sell_ratio"]
-                if ratio < MIN_RATIO_FOR_SIGNAL:
-                    log.info("SKIP %s %s: ratio=%.1f < %.1f", label, token["symbol"], ratio, MIN_RATIO_FOR_SIGNAL)
+                    log.info(
+                        "SKIP %s %s: %d/%d slots full",
+                        label, token["symbol"], active_count, MAX_SLOTS,
+                    )
                     continue
 
                 liq = token.get("dex_liquidity_usd", 0)
                 if liq < MIN_LIQUIDITY_USD and token.get("enriched"):
-                    log.info("SKIP %s %s: liquidity=$%.0f < $%.0f", label, token["symbol"], liq, MIN_LIQUIDITY_USD)
+                    log.info(
+                        "SKIP %s %s: liquidity=$%.0f < $%.0f",
+                        label, token["symbol"], liq, MIN_LIQUIDITY_USD,
+                    )
                     continue
+
+                if not token.get("enriched"):
+                    await enrich_token(client, mint)
 
                 signal_time = time.time()
                 initial_mcap = token.get("initial_mcap_usd", 0)
@@ -198,7 +280,7 @@ async def ml_scanner():
                 sim_sol_spent = 0.0
                 if v_sol > 0 and v_tokens > 0:
                     sol_after_fee = sol_amount * (1 - PUMPFUN_FEE_PCT)
-                    sol_effective = sol_after_fee * (1 - BUY_SLIPPAGE_SIM)
+                    sol_effective = sol_after_fee * (1 - BUY_SLIPPAGE_PCT)
                     k = v_sol * v_tokens
                     new_v_sol = v_sol + sol_effective
                     new_v_tokens = k / new_v_sol
@@ -211,8 +293,10 @@ async def ml_scanner():
                     vt_after = v_tokens + sim_tokens
                     vs_after = k_entry / vt_after
                     gross_out = v_sol - vs_after
-                    net_out = gross_out * (1 - PUMPFUN_FEE_PCT) * (1 - SELL_SLIPPAGE_SIM)
+                    net_out = gross_out * (1 - PUMPFUN_FEE_PCT) * (1 - SELL_SLIPPAGE_PCT)
                     entry_cost_pct = ((net_out / sim_sol_spent) - 1) * 100
+
+                entry_price_usd = bonding_curve_price_usd(v_sol, v_tokens)
 
                 signal = {
                     "mint": mint,
@@ -228,16 +312,17 @@ async def ml_scanner():
                     "sells_at_signal": sells,
                     "buy_ratio_at_signal": token["buy_sell_ratio"],
                     "sell_pressure_at_signal": token["sell_pressure"],
-                    "entry_price_usd": token.get("initial_price_usd", 0),
+                    "entry_price_usd": entry_price_usd,
+                    "entry_v_sol": v_sol,
+                    "entry_v_tokens": v_tokens,
                     "current_price_usd": None,
                     "pnl_pct": None,
-                    "pnl_usd_per_dollar": None,
+                    "pnl_usd": None,
                     "peak_pnl_pct": 0.0,
                     "gain_from_entry": 0.0,
                     "peak_gain": 0.0,
                     "entry_cost_pct": round(entry_cost_pct, 1),
                     "position_remaining_pct": 100.0,
-                    "tp_hits": [],
                     "realized_pnl": 0.0,
                     "status": "ACTIVE",
                     "close_reason": None,
@@ -249,57 +334,20 @@ async def ml_scanner():
                     "sim_sol_spent": sim_sol_spent,
                     "sim_v_sol_at_buy": v_sol,
                     "sim_v_tokens_at_buy": v_tokens,
+                    "bet_usd": BET_SIZE_USD,
                 }
                 signals.append(signal)
                 stats["signals"] += 1
                 log.info(
-                    "*** SIGNAL #%d: %s %s (%s) conf=%.0f%% buys=%d ratio=%.1f | sim: %.4f SOL -> %.0f tokens | entry_cost=%.1f%% ***",
+                    "*** SIGNAL #%d: %s %s (%s) conf=%.0f%% buys=%d ratio=%.1f | "
+                    "sim: %.4f SOL ($%.2f) -> %.0f tokens | entry_cost=%.1f%% ***",
                     stats["signals"], label, token["symbol"], mint[:8],
-                    confidence, buys, token["buy_sell_ratio"], sim_sol_spent, sim_tokens, entry_cost_pct,
+                    confidence, buys, token["buy_sell_ratio"],
+                    sim_sol_spent, BET_SIZE_USD, sim_tokens, entry_cost_pct,
                 )
 
                 if REAL_TRADING and trader:
-                    sol_amount = round(BET_SIZE_USD / SOL_PRICE_USD, 4)
                     asyncio.create_task(execute_real_buy(signal, sol_amount))
-
-
-def check_tp_ladder(sig: dict, current_pnl: float):
-    sells_done = sig.get("sells_done", 0)
-    for tp in TP_LADDER:
-        level = tp["level"]
-        sell_pct = tp["sell_pct"]
-        if current_pnl >= level and level not in sig["tp_hits"]:
-            if sells_done >= MAX_SELLS_PER_TOKEN:
-                log.info("TP %s +%.0f%%: SKIP (max %d sells reached)", sig["symbol"], level, MAX_SELLS_PER_TOKEN)
-                continue
-            remaining = sig["position_remaining_pct"]
-            if sell_pct == 100:
-                sold_portion = remaining
-            else:
-                sold_portion = remaining * (sell_pct / 100.0)
-            realized = sold_portion * (current_pnl / 100.0) / 100.0
-            sig["realized_pnl"] += realized
-            sig["position_remaining_pct"] = remaining - sold_portion
-            sig["tp_hits"].append(level)
-            sig["sells_done"] = sells_done + 1
-            sells_done += 1
-            log.info(
-                "TP HIT %s +%.0f%%: sold %.0f%% (%.1f%% remaining) | realized +$%.4f per $1",
-                sig["symbol"], level, sold_portion, sig["position_remaining_pct"], realized,
-            )
-
-            if REAL_TRADING and trader:
-                real_sell_pct = 100 if sell_pct == 100 else sell_pct
-                asyncio.create_task(execute_real_sell(sig, real_sell_pct, f"TP+{level:.0f}%"))
-
-            if sig["position_remaining_pct"] <= 0:
-                sig["status"] = "CLOSED"
-                sig["close_reason"] = f"TP+{level:.0f}% FULL EXIT"
-                sig["close_pnl_pct"] = round(sig["realized_pnl"] * 100, 1)
-                sig["close_time"] = datetime.now(timezone.utc).isoformat()
-                sig["pnl_usd_per_dollar"] = round(1 + sig["realized_pnl"], 4)
-                log.info("CLOSED %s %s: FULL EXIT at TP+%.0f%% | P&L: +%.1f%%", sig["ml_label"], sig["symbol"], level, sig["realized_pnl"] * 100)
-                return
 
 
 def check_exit_rules(sig: dict, current_pnl: float) -> str | None:
@@ -313,20 +361,32 @@ def check_exit_rules(sig: dict, current_pnl: float) -> str | None:
         sig["peak_gain"] = round(gain, 1)
 
     if gain <= STOP_LOSS_PCT:
-        return f"STOP_LOSS (gain={gain:+.1f}% <= {STOP_LOSS_PCT}%, real_pnl={current_pnl:+.1f}%)"
+        return (
+            f"STOP_LOSS (gain={gain:+.1f}% <= {STOP_LOSS_PCT}%, "
+            f"real_pnl={current_pnl:+.1f}%)"
+        )
 
     age_sec = time.time() - sig["signal_time"]
     if age_sec >= TIME_STOP_SEC and gain < TIME_STOP_MIN_GAIN:
-        return f"TIME_STOP ({age_sec:.0f}s, gain={gain:+.1f}% < +{TIME_STOP_MIN_GAIN}%, real_pnl={current_pnl:+.1f}%)"
+        return (
+            f"TIME_STOP ({age_sec:.0f}s, gain={gain:+.1f}% < "
+            f"+{TIME_STOP_MIN_GAIN}%, real_pnl={current_pnl:+.1f}%)"
+        )
 
     peak_gain = sig.get("peak_gain", 0)
     if peak_gain >= 30.0:
         drop = peak_gain - gain
         if drop >= TRAILING_STOP_PCT:
-            return f"TRAILING_STOP (peak_gain={peak_gain:+.1f}%, gain={gain:+.1f}%, drop={drop:.1f}%, real_pnl={current_pnl:+.1f}%)"
+            return (
+                f"TRAILING_STOP (peak={peak_gain:+.1f}%, gain={gain:+.1f}%, "
+                f"drop={drop:.1f}%, real_pnl={current_pnl:+.1f}%)"
+            )
 
     if peak_gain >= 15.0 and gain < 0:
-        return f"PROFIT_GONE (peak_gain={peak_gain:+.1f}%, gain={gain:+.1f}%, real_pnl={current_pnl:+.1f}%)"
+        return (
+            f"PROFIT_GONE (peak={peak_gain:+.1f}%, gain={gain:+.1f}%, "
+            f"real_pnl={current_pnl:+.1f}%)"
+        )
 
     return None
 
@@ -339,15 +399,15 @@ def close_signal(sig: dict, reason: str, pnl: float):
     sig["close_reason"] = reason
     sig["close_pnl_pct"] = round(total_pnl_per_dollar * 100, 1)
     sig["close_time"] = datetime.now(timezone.utc).isoformat()
-    sig["pnl_usd_per_dollar"] = round(1 + total_pnl_per_dollar, 4)
+    sig["pnl_usd"] = round(BET_SIZE_USD * total_pnl_per_dollar, 4)
     log.info(
-        "CLOSED %s %s: %s | Total P&L: %+.1f%% (realized: +%.1f%%, remaining %.0f%% closed at %+.1f%%)",
+        "CLOSED %s %s: %s | P&L: %+.1f%% ($%+.4f on $%.2f bet)",
         sig["ml_label"], sig["symbol"], reason,
-        total_pnl_per_dollar * 100, sig["realized_pnl"] * 100, sig["position_remaining_pct"], pnl,
+        total_pnl_per_dollar * 100, sig["pnl_usd"], BET_SIZE_USD,
     )
 
-    sells_done = sig.get("sells_done", 0)
     if REAL_TRADING and trader and sig.get("real_buy") and sig["position_remaining_pct"] > 0:
+        sells_done = sig.get("sells_done", 0)
         if sells_done < MAX_SELLS_PER_TOKEN:
             sig["sells_done"] = sells_done + 1
             asyncio.create_task(execute_real_sell(sig, 100, reason))
@@ -361,7 +421,10 @@ async def execute_real_buy(sig: dict, sol_amount: float):
             sig["real_buy_tx"] = result["tx_hash"]
             sig["real_sol_spent"] = sol_amount
             sig["buy_confirmed"] = True
-            log.info("REAL BUY OK %s: %.4f SOL | tx=%s", sig["symbol"], sol_amount, result["tx_hash"][:20])
+            log.info(
+                "REAL BUY OK %s: %.4f SOL | tx=%s",
+                sig["symbol"], sol_amount, result["tx_hash"][:20],
+            )
         else:
             log.error("REAL BUY FAILED %s: %s", sig["symbol"], result["error"])
     except Exception as e:
@@ -370,46 +433,33 @@ async def execute_real_buy(sig: dict, sol_amount: float):
 
 async def execute_real_sell(sig: dict, sell_pct: int, reason: str):
     if REAL_TRADING and not sig.get("buy_confirmed"):
-        log.warning("SELL SKIP %s: buy not confirmed yet, waiting...", sig["symbol"])
+        log.warning("SELL SKIP %s: buy not confirmed, waiting...", sig["symbol"])
         for _ in range(60):
             await asyncio.sleep(0.5)
             if sig.get("buy_confirmed"):
                 break
         if not sig.get("buy_confirmed"):
-            log.error("SELL ABORT %s: buy never confirmed after 30s", sig["symbol"])
+            log.error("SELL ABORT %s: buy never confirmed", sig["symbol"])
             return {"success": False, "error": "buy not confirmed"}
     try:
         result = await trader.sell_token(sig["mint"], sell_pct, sig["symbol"], reason)
         if result["success"]:
-            log.info("REAL SELL OK %s %d%% (%s): tx=%s | balance=%.4f SOL", sig["symbol"], sell_pct, reason, result["tx_hash"][:20], trader.sol_balance)
+            log.info(
+                "REAL SELL OK %s %d%% (%s): tx=%s",
+                sig["symbol"], sell_pct, reason, result["tx_hash"][:20],
+            )
         else:
-            log.error("REAL SELL FAILED %s (%s): %s", sig["symbol"], reason, result.get("error", "not confirmed"))
+            log.error(
+                "REAL SELL FAILED %s (%s): %s",
+                sig["symbol"], reason, result.get("error", ""),
+            )
         return result
     except Exception as e:
         log.error("REAL SELL ERROR %s: %s", sig["symbol"], e)
         return {"success": False, "error": str(e)}
 
 
-def calc_bonding_curve_pnl(sig: dict, token_data: dict) -> float | None:
-    sim_tokens = sig.get("sim_tokens_bought", 0)
-    sim_sol_spent = sig.get("sim_sol_spent", 0)
-    if sim_tokens <= 0 or sim_sol_spent <= 0:
-        return None
-    cur_v_sol = token_data.get("v_sol_in_bonding", 0)
-    cur_v_tokens = token_data.get("v_tokens_in_bonding", 0)
-    if cur_v_sol <= 0 or cur_v_tokens <= 0:
-        return None
-    k = cur_v_sol * cur_v_tokens
-    new_v_tokens = cur_v_tokens + sim_tokens
-    new_v_sol = k / new_v_tokens
-    gross_sol_out = cur_v_sol - new_v_sol
-    sol_after_fee = gross_sol_out * (1 - PUMPFUN_FEE_PCT)
-    sol_after_slippage = sol_after_fee * (1 - SELL_SLIPPAGE_SIM)
-    pnl_pct = ((sol_after_slippage / sim_sol_spent) - 1) * 100
-    return pnl_pct
-
-
-async def signal_price_updater(client: httpx.AsyncClient):
+async def signal_price_updater():
     while True:
         await asyncio.sleep(PRICE_POLL_INTERVAL)
         active = [s for s in signals if s["status"] == "ACTIVE"]
@@ -428,6 +478,10 @@ async def signal_price_updater(client: httpx.AsyncClient):
                         sig["peak_pnl_pct"] = round(current_pnl, 1)
                     sig["checked_at"] = datetime.now(timezone.utc).isoformat()
 
+                    v_sol = token_data.get("v_sol_in_bonding", 0)
+                    v_tokens = token_data.get("v_tokens_in_bonding", 0)
+                    sig["current_price_usd"] = bonding_curve_price_usd(v_sol, v_tokens)
+
                     reason = check_exit_rules(sig, current_pnl)
                     if reason:
                         close_signal(sig, reason, current_pnl)
@@ -435,8 +489,7 @@ async def signal_price_updater(client: httpx.AsyncClient):
                         remaining = sig["position_remaining_pct"] / 100.0
                         unrealized = remaining * (current_pnl / 100.0)
                         total = sig["realized_pnl"] + unrealized
-                        sig["pnl_usd_per_dollar"] = round(1 + total, 4)
-
+                        sig["pnl_usd"] = round(BET_SIZE_USD * total, 4)
             except Exception:
                 pass
 
@@ -469,9 +522,13 @@ async def listen_pumpportal():
                     v_sol = float(msg.get("vSolInBondingCurve") or 0)
                     v_tokens = float(msg.get("vTokensInBondingCurve") or 0)
                     mcap_sol = float(msg.get("marketCapSol") or 0)
-                    init_buy = float(msg.get("initialBuy") or 0)
+                    init_buy = (
+                        float(msg.get("initialBuy") or 0) / 1e9
+                        if msg.get("initialBuy")
+                        else 0
+                    )
 
-                    price_sol = v_sol / v_tokens if v_tokens > 0 else 0
+                    price_sol = bonding_curve_price_sol(v_sol, v_tokens)
                     price_usd = price_sol * SOL_PRICE_USD
                     mcap_usd = mcap_sol * SOL_PRICE_USD
 
@@ -486,14 +543,13 @@ async def listen_pumpportal():
                         "initial_price_sol": price_sol,
                         "initial_price_usd": price_usd,
                         "initial_mcap_usd": mcap_usd,
-                        "initial_v_sol": v_sol,
-                        "initial_v_tokens": v_tokens,
                         "market_cap_sol": mcap_sol,
                         "v_tokens_in_bonding": v_tokens,
                         "v_sol_in_bonding": v_sol,
                         "dev_address": msg.get("traderPublicKey", ""),
                         "migrated": False,
                         "enriched": False,
+                        "enrich_tried": False,
                         "dex_liquidity_usd": 0,
                         "dex_volume_5m": 0,
                         "dex_volume_1h": 0,
@@ -503,9 +559,6 @@ async def listen_pumpportal():
                         "dex_sells_1h": 0,
                         "dex_market_cap": 0,
                         "dex_fdv": 0,
-                        "dex_change_5m": 0,
-                        "dex_change_1h": 0,
-                        "dex_dex_id": "",
                         "has_website": False,
                         "has_socials": False,
                         "ml_checked": False,
@@ -513,11 +566,18 @@ async def listen_pumpportal():
                         "ml_confidence": None,
                     }
 
-                    trade_counts[mint] = {"buys": 0, "sells": 0, "buy_sol": 0, "sell_sol": 0, "buyers": set(), "sellers": set()}
+                    trade_counts[mint] = {
+                        "buys": 0, "sells": 0,
+                        "buy_sol": 0, "sell_sol": 0,
+                        "buyers": set(), "sellers": set(),
+                    }
                     stats["total"] += 1
 
                     if stats["total"] % 20 == 0:
-                        log.info("[%ds] tokens=%d signals=%d trades=%d", elapsed, stats["total"], stats["signals"], stats["trades"])
+                        log.info(
+                            "[%ds] tokens=%d signals=%d trades=%d",
+                            elapsed, stats["total"], stats["signals"], stats["trades"],
+                        )
 
                     await ws.send(json.dumps({
                         "method": "subscribeTokenTrade",
@@ -526,52 +586,61 @@ async def listen_pumpportal():
 
                 elif msg.get("txType") in ("buy", "sell"):
                     mint = msg.get("mint", "")
-                    if mint in trade_counts:
-                        tx = msg["txType"]
-                        sol_amount = float(msg.get("solAmount") or 0)
-                        tc = trade_counts[mint]
-                        trader_key = msg.get("traderPublicKey", "")
-                        if tx == "buy":
-                            tc["buys"] += 1
-                            tc["buy_sol"] += sol_amount
-                            if trader_key:
-                                tc["buyers"].add(trader_key)
-                        else:
-                            tc["sells"] += 1
-                            tc["sell_sol"] += sol_amount
-                            if trader_key:
-                                tc["sellers"].add(trader_key)
+                    if mint not in trade_counts:
+                        continue
 
-                        new_mcap = float(msg.get("marketCapSol") or 0)
-                        new_v_sol = float(msg.get("vSolInBondingCurve") or 0)
-                        new_v_tokens = float(msg.get("vTokensInBondingCurve") or 0)
-                        if mint in tokens:
-                            if new_mcap > 0:
-                                tokens[mint]["latest_mcap_sol"] = new_mcap
-                                tokens[mint]["latest_mcap_usd"] = new_mcap * SOL_PRICE_USD
-                            if new_v_sol > 0:
-                                tokens[mint]["v_sol_in_bonding"] = new_v_sol
-                            if new_v_tokens > 0:
-                                tokens[mint]["v_tokens_in_bonding"] = new_v_tokens
+                    tx = msg["txType"]
+                    sol_amount = float(msg.get("solAmount") or 0)
+                    trader_key = msg.get("traderPublicKey", "")
+                    tc = trade_counts[mint]
 
-                        for sig in signals:
-                            if sig["mint"] == mint and sig["status"] == "ACTIVE":
-                                real_pnl = calc_bonding_curve_pnl(sig, tokens.get(mint, {}))
-                                if real_pnl is not None:
-                                    sig["pnl_pct"] = round(real_pnl, 1)
-                                    if real_pnl > sig.get("peak_pnl_pct", 0):
-                                        sig["peak_pnl_pct"] = round(real_pnl, 1)
-                                    sig["checked_at"] = datetime.now(timezone.utc).isoformat()
-                                    reason = check_exit_rules(sig, real_pnl)
-                                    if reason:
-                                        close_signal(sig, reason, real_pnl)
-                                    else:
-                                        remaining = sig["position_remaining_pct"] / 100.0
-                                        unrealized = remaining * (real_pnl / 100.0)
-                                        total = sig["realized_pnl"] + unrealized
-                                        sig["pnl_usd_per_dollar"] = round(1 + total, 4)
+                    if tx == "buy":
+                        tc["buys"] += 1
+                        tc["buy_sol"] += sol_amount
+                        if trader_key:
+                            tc["buyers"].add(trader_key)
+                    else:
+                        tc["sells"] += 1
+                        tc["sell_sol"] += sol_amount
+                        if trader_key:
+                            tc["sellers"].add(trader_key)
 
-                        stats["trades"] += 1
+                    new_v_sol = float(msg.get("vSolInBondingCurve") or 0)
+                    new_v_tokens = float(msg.get("vTokensInBondingCurve") or 0)
+                    new_mcap_sol = float(msg.get("marketCapSol") or 0)
+
+                    if mint in tokens:
+                        if new_mcap_sol > 0:
+                            tokens[mint]["latest_mcap_sol"] = new_mcap_sol
+                            tokens[mint]["latest_mcap_usd"] = new_mcap_sol * SOL_PRICE_USD
+                        if new_v_sol > 0:
+                            tokens[mint]["v_sol_in_bonding"] = new_v_sol
+                        if new_v_tokens > 0:
+                            tokens[mint]["v_tokens_in_bonding"] = new_v_tokens
+
+                    for sig in signals:
+                        if sig["mint"] == mint and sig["status"] == "ACTIVE":
+                            real_pnl = calc_bonding_curve_pnl(sig, tokens.get(mint, {}))
+                            if real_pnl is not None:
+                                sig["pnl_pct"] = round(real_pnl, 1)
+                                if real_pnl > sig.get("peak_pnl_pct", 0):
+                                    sig["peak_pnl_pct"] = round(real_pnl, 1)
+                                sig["checked_at"] = datetime.now(timezone.utc).isoformat()
+
+                                v_s = tokens.get(mint, {}).get("v_sol_in_bonding", 0)
+                                v_t = tokens.get(mint, {}).get("v_tokens_in_bonding", 0)
+                                sig["current_price_usd"] = bonding_curve_price_usd(v_s, v_t)
+
+                                reason = check_exit_rules(sig, real_pnl)
+                                if reason:
+                                    close_signal(sig, reason, real_pnl)
+                                else:
+                                    remaining = sig["position_remaining_pct"] / 100.0
+                                    unrealized = remaining * (real_pnl / 100.0)
+                                    total = sig["realized_pnl"] + unrealized
+                                    sig["pnl_usd"] = round(BET_SIZE_USD * total, 4)
+
+                    stats["trades"] += 1
 
         except websockets.exceptions.ConnectionClosed:
             log.warning("Disconnected, reconnecting in 3s...")
@@ -592,36 +661,34 @@ def print_signals_report():
     closed = [s for s in signals if s["status"] == "CLOSED"]
 
     lines = []
-    lines.append(f"=== SIGNAL REPORT | Active: {len(active)} | Closed: {len(closed)} | Total: {len(signals)} ===")
+    lines.append(
+        f"=== SIGNAL REPORT | Active: {len(active)} | Closed: {len(closed)} "
+        f"| Total: {len(signals)} ==="
+    )
 
-    balance = 0.0
-    invested = 0
+    total_pnl_usd = 0.0
+    total_invested = 0
 
     if active:
         lines.append("--- ACTIVE POSITIONS ---")
         for sig in active:
             age = int(time.time() - sig["signal_time"])
             pnl = sig.get("pnl_pct")
-            peak = sig.get("peak_pnl_pct", 0)
-            remaining = sig.get("position_remaining_pct", 100)
-            tp_str = f" TP:{','.join(f'+{int(t)}%' for t in sig.get('tp_hits', []))}" if sig.get("tp_hits") else ""
-
-            gain = sig.get("gain_from_entry", 0)
             peak_gain = sig.get("peak_gain", 0)
+            gain = sig.get("gain_from_entry", 0)
+
             if pnl is not None:
-                pnl_str = f"real={pnl:+.1f}% gain={gain:+.1f}%"
-                val = sig.get("pnl_usd_per_dollar", 1.0)
+                pnl_usd = BET_SIZE_USD * (pnl / 100.0)
+                pnl_str = f"pnl={pnl:+.1f}% (${pnl_usd:+.2f})"
+                total_pnl_usd += pnl_usd
             else:
                 pnl_str = "waiting..."
-                val = 1.0
 
-            balance += val
-            invested += 1
-
+            total_invested += 1
             lines.append(
-                f"  ACTIVE {sig['ml_label']} {sig['symbol']} | "
-                f"{pnl_str} | peak_gain: {peak_gain:+.1f}% | pos: {remaining:.0f}%{tp_str} | "
-                f"{age}s ago | buys={sig['buys_at_signal']} ratio={sig['buy_ratio_at_signal']}"
+                f"  {sig['ml_label']} {sig['symbol']} | {pnl_str} | "
+                f"peak={peak_gain:+.1f}% | {age}s ago | "
+                f"buys={sig['buys_at_signal']}"
             )
 
     if closed:
@@ -630,23 +697,29 @@ def print_signals_report():
         losses = 0
         for sig in closed:
             cpnl = sig.get("close_pnl_pct", 0)
-            val = sig.get("pnl_usd_per_dollar", 1 + cpnl / 100)
-            balance += val
-            invested += 1
+            pnl_usd = sig.get("pnl_usd", BET_SIZE_USD * cpnl / 100)
+            total_pnl_usd += pnl_usd
+            total_invested += 1
             if cpnl > 0:
                 wins += 1
             else:
                 losses += 1
-            tp_str = f" TP:{','.join(f'+{int(t)}%' for t in sig.get('tp_hits', []))}" if sig.get("tp_hits") else ""
             lines.append(
-                f"  CLOSED {sig['symbol']} | real={cpnl:+.1f}% ${val:.2f}{tp_str} | {sig['close_reason']}"
+                f"  {sig['symbol']} | {cpnl:+.1f}% (${pnl_usd:+.2f}) | "
+                f"{sig['close_reason']}"
             )
         if wins + losses > 0:
-            lines.append(f"  Closed stats: {wins}W / {losses}L ({wins/(wins+losses)*100:.0f}% win rate)")
+            lines.append(
+                f"  Stats: {wins}W / {losses}L "
+                f"({wins/(wins+losses)*100:.0f}% win rate)"
+            )
 
-    if invested > 0:
-        total_pnl = ((balance / invested) - 1) * 100
-        lines.append(f"  BALANCE: ${invested} invested -> ${balance:.2f} ({total_pnl:+.1f}%)")
+    if total_invested > 0:
+        total_bet = total_invested * BET_SIZE_USD
+        lines.append(
+            f"  TOTAL: ${total_bet:.2f} invested -> "
+            f"P&L: ${total_pnl_usd:+.2f} ({total_pnl_usd/total_bet*100:+.1f}%)"
+        )
 
     if not signals:
         lines.append("  No signals yet...")
@@ -664,16 +737,25 @@ def save_session():
         token["total_sells"] = tc.get("sells", 0)
         token["total_buy_sol"] = round(tc.get("buy_sol", 0), 4)
         token["total_sell_sol"] = round(tc.get("sell_sol", 0), 4)
-        token["buy_sell_ratio"] = round(tc.get("buys", 0) / max(1, tc.get("sells", 1)), 2)
-        token["sell_pressure"] = round(tc.get("sells", 0) / max(1, tc.get("buys", 1) + tc.get("sells", 0)) * 100, 1)
+        token["buy_sell_ratio"] = round(
+            tc.get("buys", 0) / max(1, tc.get("sells", 1)), 2
+        )
+        token["sell_pressure"] = round(
+            tc.get("sells", 0) / max(1, tc.get("buys", 1) + tc.get("sells", 0)) * 100, 1
+        )
 
     active_count = sum(1 for s in signals if s["status"] == "ACTIVE")
     closed_count = sum(1 for s in signals if s["status"] == "CLOSED")
-    closed_wins = sum(1 for s in signals if s["status"] == "CLOSED" and (s.get("close_pnl_pct", 0) or 0) > 0)
+    closed_wins = sum(
+        1 for s in signals
+        if s["status"] == "CLOSED" and (s.get("close_pnl_pct", 0) or 0) > 0
+    )
 
     output = {
         "meta": {
-            "start_time": datetime.fromtimestamp(stats["start"], tz=timezone.utc).isoformat(),
+            "start_time": datetime.fromtimestamp(
+                stats["start"], tz=timezone.utc
+            ).isoformat(),
             "end_time": datetime.now(timezone.utc).isoformat(),
             "duration_sec": int(time.time() - stats["start"]),
             "sol_price_usd": SOL_PRICE_USD,
@@ -683,18 +765,24 @@ def save_session():
             "active_signals": active_count,
             "closed_signals": closed_count,
             "closed_wins": closed_wins,
+            "price_source": "pumpfun_bonding_curve",
         },
         "config": {
+            "bet_size_usd": BET_SIZE_USD,
+            "max_slots": MAX_SLOTS,
             "min_buys": MIN_BUYS_FOR_SIGNAL,
-            "min_ratio": MIN_RATIO_FOR_SIGNAL,
+            "min_confidence": MIN_CONFIDENCE_PCT,
+            "min_liquidity": MIN_LIQUIDITY_USD,
             "stop_loss_pct": STOP_LOSS_PCT,
+            "trailing_stop_pct": TRAILING_STOP_PCT,
             "time_stop_sec": TIME_STOP_SEC,
             "time_stop_min_gain": TIME_STOP_MIN_GAIN,
-            "trailing_stop_pct": TRAILING_STOP_PCT,
-            "tp_ladder": "DISABLED - trailing stop only",
+            "buy_slippage": BUY_SLIPPAGE_PCT,
+            "sell_slippage": SELL_SLIPPAGE_PCT,
+            "pumpfun_fee": PUMPFUN_FEE_PCT,
+            "rocket_only": ROCKET_ONLY,
         },
         "signals": signals,
-        "tokens": list(tokens.values()),
     }
 
     with open(filepath, "w") as f:
@@ -712,18 +800,29 @@ async def report_printer():
 
 
 async def main():
-    duration = COLLECT_DURATION
+    duration = int(os.getenv("MONITOR_DURATION", "1800"))
     log.info("=" * 60)
-    mode_str = "REAL TRADING" if REAL_TRADING else "SIMULATION"
-    log.info("LIVE ML MONITOR v6 [%s] — BONDING CURVE P&L", mode_str)
+    mode_str = "REAL TRADING" if REAL_TRADING else "PAPER TRADING"
+    log.info("SOLANA SNIPER BOT V2 [%s]", mode_str)
     log.info("Duration: %d seconds", duration)
-    log.info("Bet size: $%.0f | Max slots: %d | 1 buy + 1 sell per token", BET_SIZE_USD, MAX_SLOTS)
+    log.info(
+        "Bet: $%.2f | Max slots: %d | Price: bonding curve ONLY",
+        BET_SIZE_USD, MAX_SLOTS,
+    )
     rocket_str = "ROCKET only" if ROCKET_ONLY else "ROCKET + winner"
-    log.info("Filters: %s, conf >= %.0f%%, buys >= %d, liquidity >= $%.0f", rocket_str, MIN_CONFIDENCE_PCT, MIN_BUYS_FOR_SIGNAL, MIN_LIQUIDITY_USD)
-    log.info("Stop-loss: %.0f%% | Time-stop: %ds (min +%.0f%%)", STOP_LOSS_PCT, TIME_STOP_SEC, TIME_STOP_MIN_GAIN)
-    log.info("Trailing stop: -%.0f%% from peak (activates at +30%%) | Price poll: %.1fs", TRAILING_STOP_PCT, PRICE_POLL_INTERVAL)
-    log.info("P&L: bonding curve simulation (buy slip %.0f%%, sell slip %.0f%%, fee %.0f%%)", BUY_SLIPPAGE_SIM*100, SELL_SLIPPAGE_SIM*100, PUMPFUN_FEE_PCT*100)
-    log.info("Strategy: NO TP ladder, trailing stop only (1 sell per token)")
+    log.info(
+        "Filters: %s, conf >= %.0f%%, buys >= %d, liquidity >= $%.0f",
+        rocket_str, MIN_CONFIDENCE_PCT, MIN_BUYS_FOR_SIGNAL, MIN_LIQUIDITY_USD,
+    )
+    log.info(
+        "Stop-loss: %.0f%% | Time-stop: %ds (min +%.0f%%) | "
+        "Trailing: -%.0f%% from peak (activates at +30%%)",
+        STOP_LOSS_PCT, TIME_STOP_SEC, TIME_STOP_MIN_GAIN, TRAILING_STOP_PCT,
+    )
+    log.info(
+        "Fees: buy slip %.0f%%, sell slip %.0f%%, PumpFun fee %.0f%%",
+        BUY_SLIPPAGE_PCT * 100, SELL_SLIPPAGE_PCT * 100, PUMPFUN_FEE_PCT * 100,
+    )
     log.info("=" * 60)
 
     if not load_model():
@@ -733,7 +832,7 @@ async def main():
     if REAL_TRADING:
         init_trader()
         if not trader:
-            log.error("Failed to init trader. Check SOLANA_PRIVATE_KEY in .env")
+            log.error("Failed to init trader. Check .env")
             return
 
     stats["start"] = time.time()
@@ -742,16 +841,19 @@ async def main():
         await fetch_sol_price(client)
 
         listener = asyncio.create_task(listen_pumpportal())
-        scanner = asyncio.create_task(ml_scanner())
-        price_updater = asyncio.create_task(signal_price_updater(client))
+        scanner = asyncio.create_task(ml_scanner(client))
+        price_updater = asyncio.create_task(signal_price_updater())
+        enricher = asyncio.create_task(enrich_batch(client))
         reporter = asyncio.create_task(report_printer())
 
         await asyncio.sleep(duration)
 
-        log.info("Signal collection ended. Tracking active positions for 2 more minutes...")
+        log.info(
+            "Signal collection ended. Tracking active positions for 2 more minutes..."
+        )
         listener.cancel()
         scanner.cancel()
-        reporter.cancel()
+        enricher.cancel()
 
         track_extra = 120
         await asyncio.sleep(track_extra)
@@ -759,25 +861,26 @@ async def main():
         log.info("Tracking period ended. Closing all active positions...")
         for sig in signals:
             if sig["status"] == "ACTIVE":
-                pnl = sig.get("pnl_pct", 0) or 0
-                close_signal(sig, "SESSION_END", pnl)
+                final_pnl = sig.get("pnl_pct", 0) or 0
+                close_signal(sig, "SESSION_END", final_pnl)
 
-        log.info("Final price update...")
-        await asyncio.sleep(5)
         price_updater.cancel()
+        reporter.cancel()
 
-    filepath = save_session()
     report = print_signals_report()
     log.info("\n%s", report)
 
-    if REAL_TRADING and trader:
-        await asyncio.sleep(3)
-        final_bal = trader.get_sol_balance()
-        summary = trader.get_trade_summary()
-        log.info("WALLET: %.4f SOL ($%.2f) | initial: %.4f SOL", final_bal, final_bal * SOL_PRICE_USD, trader.initial_balance)
-        log.info("TRADES: %s", summary)
+    filepath = save_session()
+    log.info("DONE! Session saved to: %s", filepath)
 
-    log.info("DONE! Session: %s", filepath)
+    if REAL_TRADING and trader:
+        final_bal = trader.refresh_balance()
+        pnl_sol = final_bal - trader.initial_balance
+        pnl_usd = pnl_sol * SOL_PRICE_USD
+        log.info(
+            "REAL WALLET: %.4f -> %.4f SOL (%+.4f SOL / $%+.2f)",
+            trader.initial_balance, final_bal, pnl_sol, pnl_usd,
+        )
 
 
 if __name__ == "__main__":
