@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import httpx
 import websockets
 import numpy as np
-import joblib
+import torch
 
 from config import (
     PUMPPORTAL_WS_URL,
@@ -39,25 +39,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("live_monitor")
 
-FEATURES = None
+from train_nn import EntryNet, ExitNet, ENTRY_FEATURES, EXIT_POSITION_FEATURES
 
-def _load_features():
-    global FEATURES
-    meta_path = os.path.join(DATA_DIR, "model_meta.json")
-    if os.path.exists(meta_path):
-        import json as _json
-        with open(meta_path) as f:
-            meta = _json.load(f)
-        FEATURES = meta.get("features", [])
-        log.info("Loaded %d features from model_meta.json", len(FEATURES))
-    else:
-        FEATURES = [
-            "initial_buy_sol", "initial_price_usd", "initial_mcap_usd",
-            "v_sol_in_bonding", "v_tokens_in_bonding",
-            "total_buys", "total_sells", "total_buy_sol", "total_sell_sol",
-            "buy_sell_ratio", "sell_pressure", "unique_buyers", "unique_sellers",
-            "trade_count", "migrated",
-        ]
+FEATURES = ENTRY_FEATURES
 
 MIN_BUYS_FOR_SIGNAL = 5
 MAX_BUYS_FOR_SIGNAL = 999
@@ -70,8 +54,12 @@ signals: list[dict] = []
 stats = {"total": 0, "enriched": 0, "trades": 0, "signals": 0, "start": 0}
 
 SOL_PRICE_USD = 200.0
-model = None
-scaler = None
+entry_model = None
+exit_model = None
+entry_mean = None
+entry_std = None
+exit_mean = None
+exit_std = None
 seen_mints: set[str] = set()
 
 
@@ -100,37 +88,45 @@ def init_trader():
 
 
 def load_model():
-    global model, scaler
-    model_path = os.path.join(DATA_DIR, "model.pkl")
-    scaler_path = os.path.join(DATA_DIR, "scaler.pkl")
-    if os.path.exists(model_path) and os.path.exists(scaler_path):
-        model = joblib.load(model_path)
-        scaler = joblib.load(scaler_path)
-        log.info("ML model loaded from %s", model_path)
-        return True
-    log.error("No model found at %s", model_path)
-    return False
+    global entry_model, exit_model, entry_mean, entry_std, exit_mean, exit_std
+    entry_path = os.path.join(DATA_DIR, "entry_model.pt")
+    exit_path = os.path.join(DATA_DIR, "exit_model.pt")
+    if not os.path.exists(entry_path):
+        log.error("No entry model at %s", entry_path)
+        return False
+    state = torch.load(entry_path, map_location="cpu", weights_only=False)
+    n_feat = state["n_features"]
+    entry_model = EntryNet(n_feat)
+    entry_model.load_state_dict(state["model"])
+    entry_model.eval()
+    entry_mean = np.array(state["mean"], dtype=np.float32)
+    entry_std = np.array(state["std"], dtype=np.float32)
+    log.info("Entry NN loaded (%d features)", n_feat)
+    if os.path.exists(exit_path):
+        xs = torch.load(exit_path, map_location="cpu", weights_only=False)
+        n_xf = xs["n_features"]
+        exit_model = ExitNet(n_xf)
+        exit_model.load_state_dict(xs["model"])
+        exit_model.eval()
+        exit_mean = np.array(xs["mean"], dtype=np.float32)
+        exit_std = np.array(xs["std"], dtype=np.float32)
+        log.info("Exit NN loaded (%d features)", n_xf)
+    return True
 
 
 def predict_token(token_data: dict) -> tuple[str, float]:
-    if model is None or scaler is None:
+    if entry_model is None:
         return "no_model", 0.0
     values = []
     for f in FEATURES:
         v = token_data.get(f, 0)
-        if f in ("has_website", "has_socials", "migrated"):
-            v = int(v) if v else 0
         values.append(float(v) if v else 0.0)
-    X = np.array([values])
-    X_scaled = scaler.transform(X)
-    pred = model.predict(X_scaled)[0]
-    proba = model.predict_proba(X_scaled)[0]
-    if len(proba) == 2:
-        label = "ROCKET" if pred == 1 else "trash"
-        confidence = proba[1] * 100
-    else:
-        label = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}.get(pred, "unknown")
-        confidence = max(proba) * 100
+    X = np.array([values], dtype=np.float32)
+    X_n = (X - entry_mean) / entry_std
+    with torch.no_grad():
+        prob = entry_model(torch.from_numpy(X_n)).item()
+    confidence = prob * 100
+    label = "ROCKET" if prob >= 0.5 else "trash"
     return label, confidence
 
 
@@ -388,6 +384,8 @@ async def ml_scanner(client: httpx.AsyncClient):
                     asyncio.create_task(execute_real_buy(signal, sol_amount))
 
 
+NO_EXIT_RULES = "--no-exits" in sys.argv
+
 def check_exit_rules(sig: dict, current_pnl: float) -> str | None:
     if sig["status"] != "ACTIVE":
         return None
@@ -397,6 +395,9 @@ def check_exit_rules(sig: dict, current_pnl: float) -> str | None:
     sig["gain_from_entry"] = round(gain, 1)
     if gain > sig.get("peak_gain", 0):
         sig["peak_gain"] = round(gain, 1)
+
+    if NO_EXIT_RULES:
+        return None
 
     if gain <= STOP_LOSS_PCT:
         return (
@@ -863,9 +864,8 @@ async def main():
     log.info("=" * 60)
 
     if not load_model():
-        log.error("Cannot start without ML model. Run train_model.py first.")
+        log.error("Cannot start without ML model. Run train_nn.py first.")
         return
-    _load_features()
 
     if REAL_TRADING:
         init_trader()
