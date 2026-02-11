@@ -1,7 +1,7 @@
 {
-  "trained_at": "2026-02-11T04:15:02.052064+00:00",
+  "trained_at": "2026-02-11T13:56:46.654880+00:00",
   "model_type": "rf",
-  "n_samples": 9700,
+  "n_samples": 4318,
   "n_features": 8,
   "features": [
     "log_buy_sol",
@@ -19,11 +19,16 @@
     "1": "profitable"
   },
   "sim_config": {
-    "entry_snapshot": "60s",
-    "cost_roundtrip": 0.9317,
+    "entry_age_range": [
+      30,
+      120
+    ],
+    "cost_buy": 0.9702,
+    "cost_sell": 0.9603,
     "stop_loss": -15.0,
     "trailing_stop": 15.0,
     "time_stop_sec": 60,
-    "time_stop_min_gain": 10.0
+    "time_stop_min_gain": 10.0,
+    "max_hold_sec": 900
   }
 }
