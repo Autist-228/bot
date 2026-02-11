@@ -68,6 +68,32 @@ exit_mean = None
 exit_std = None
 seen_mints: set[str] = set()
 
+error_log: list[dict] = []
+model_info: dict = {
+    "cycles": 0, "loss": 0.0, "initial_loss": 0.0,
+    "total_samples": 0, "total_wins": 0,
+    "rockets_found": 0, "rockets_missed": 0, "avg_missed_pnl": 0.0,
+    "last_train_ts": 0, "last_save_time": "---", "file_size_kb": 0,
+}
+
+telegram_state: dict = {
+    "signals": signals,
+    "tokens": tokens,
+    "stats": stats,
+    "errors": error_log,
+    "model_info": model_info,
+    "bet_size": BET_SIZE_USD,
+    "ws_connected": False,
+    "ml_running": False,
+    "learner_running": False,
+}
+
+
+def log_error(msg: str):
+    error_log.append({"ts": time.time(), "msg": msg})
+    if len(error_log) > 500:
+        error_log.pop(0)
+
 
 def bonding_curve_price_sol(v_sol: float, v_tokens: float) -> float:
     if v_tokens <= 0:
@@ -221,6 +247,7 @@ def calc_bonding_curve_pnl(sig: dict, token_data: dict) -> float | None:
 
 async def ml_scanner(client: httpx.AsyncClient):
     debug_count = [0]
+    telegram_state["ml_running"] = True
     while True:
         await asyncio.sleep(5)
         now = time.time()
@@ -559,6 +586,7 @@ async def listen_pumpportal():
         try:
             ws = await websockets.connect(PUMPPORTAL_WS_URL)
             log.info("Connected to PumpPortal WebSocket")
+            telegram_state["ws_connected"] = True
             await ws.send(json.dumps({"method": "subscribeNewToken"}))
             log.info("Subscribed to newToken events")
 
@@ -860,6 +888,15 @@ async def report_printer():
 INCREMENTAL_INTERVAL = 600
 incremental_trained_mints: set[str] = set()
 resolved_missed: list[dict] = []
+
+
+def _update_model_file_info():
+    entry_path = os.path.join(DATA_DIR, "entry_model.pt")
+    if os.path.exists(entry_path):
+        model_info["file_size_kb"] = round(os.path.getsize(entry_path) / 1024)
+        model_info["last_save_time"] = datetime.fromtimestamp(
+            os.path.getmtime(entry_path), tz=timezone.utc
+        ).strftime("%H:%M:%S UTC")
 MEMORY_CLEANUP_INTERVAL = 1800
 TOKEN_MAX_AGE = 1800
 
@@ -939,6 +976,10 @@ async def missed_token_checker():
                     mt["symbol"], hyp_pnl, weight,
                 )
         if checked > 0:
+            model_info["rockets_missed"] += rockets
+            all_pnls = [r["pnl"] for r in resolved_missed[-checked:] if r.get("pnl")]
+            if all_pnls:
+                model_info["avg_missed_pnl"] = sum(p for p in all_pnls if p > 0) / max(1, len([p for p in all_pnls if p > 0]))
             log.info(
                 "MISSED CHECK: %d tokens resolved, %d were rockets, %d confirmed trash",
                 checked, rockets, checked - rockets,
@@ -1025,10 +1066,20 @@ async def incremental_learner():
         entry_model.eval()
 
         wins = int(y.sum())
+        final_loss = loss.item()
         log.info(
             "INCREMENTAL: trained on %d samples (%d wins, %.0f%%) | loss=%.4f",
-            total, wins, wins / total * 100, loss.item(),
+            total, wins, wins / total * 100, final_loss,
         )
+
+        model_info["cycles"] += 1
+        model_info["loss"] = final_loss
+        if model_info["initial_loss"] == 0:
+            model_info["initial_loss"] = final_loss
+        model_info["total_samples"] += total
+        model_info["total_wins"] += wins
+        model_info["last_train_ts"] = time.time()
+        telegram_state["learner_running"] = True
 
         pending_samples.clear()
 
@@ -1039,6 +1090,7 @@ async def incremental_learner():
             "mean": entry_mean.tolist(),
             "std": entry_std.tolist(),
         }, entry_path)
+        _update_model_file_info()
         log.info("INCREMENTAL: model saved to %s", entry_path)
 
 
@@ -1112,6 +1164,14 @@ async def main():
             return
 
     stats["start"] = time.time()
+    _update_model_file_info()
+
+    tg_bot = None
+    tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    tg_chat = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+    if tg_token and tg_chat:
+        from telegram_bot import SniperTelegramBot
+        tg_bot = SniperTelegramBot(tg_token, tg_chat, telegram_state)
 
     async with httpx.AsyncClient() as client:
         await fetch_sol_price(client)
@@ -1126,6 +1186,9 @@ async def main():
         cleaner = asyncio.create_task(memory_cleanup())
         saver = asyncio.create_task(auto_saver())
 
+        if tg_bot:
+            await tg_bot.start()
+
         if CONTINUOUS:
             log.info("CONTINUOUS MODE: bot will run until manually stopped (Ctrl+C)")
             try:
@@ -1138,6 +1201,8 @@ async def main():
                     )
             except asyncio.CancelledError:
                 log.info("Continuous mode interrupted, shutting down...")
+                if tg_bot:
+                    await tg_bot.stop()
         else:
             await asyncio.sleep(duration)
 
