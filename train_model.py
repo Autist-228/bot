@@ -243,31 +243,38 @@ def pnl_to_label(pnl):
     return "trash"
 
 
-def load_and_prepare(data_dir=None):
-    directory = data_dir or DATA_DIR
-
-    hist_files = sorted(glob.glob(os.path.join(directory, "historical_36h_*.json")))
-    if not hist_files:
-        hist_files = sorted(glob.glob(os.path.join(directory, "historical_*h_*.json")))
-
-    collect_files = sorted(glob.glob(os.path.join(directory, "collect_*.json")))
+def load_and_prepare(data_dir=None, data_file=None):
     all_tokens = []
 
-    for fp in hist_files:
-        with open(fp) as f:
+    if data_file and os.path.isfile(data_file):
+        with open(data_file) as f:
             data = json.load(f)
         tokens = data.get("tokens", [])
         has_trades = sum(1 for t in tokens if t.get("trades"))
-        log.info("Loaded %d tokens (%d with trades) from %s", len(tokens), has_trades, os.path.basename(fp))
+        log.info("Loaded %d tokens (%d with trades) from %s", len(tokens), has_trades, os.path.basename(data_file))
         all_tokens.extend(tokens)
+    else:
+        directory = data_dir or DATA_DIR
+        hist_files = sorted(glob.glob(os.path.join(directory, "historical_36h_*.json")))
+        if not hist_files:
+            hist_files = sorted(glob.glob(os.path.join(directory, "historical_*h_*.json")))
+        collect_files = sorted(glob.glob(os.path.join(directory, "collect_*.json")))
 
-    for fp in collect_files:
-        with open(fp) as f:
-            data = json.load(f)
-        tokens = data.get("tokens", [])
-        has_trades = sum(1 for t in tokens if t.get("trades"))
-        log.info("Loaded %d tokens (%d with trades) from %s", len(tokens), has_trades, os.path.basename(fp))
-        all_tokens.extend(tokens)
+        for fp in hist_files:
+            with open(fp) as f:
+                data = json.load(f)
+            tokens = data.get("tokens", [])
+            has_trades = sum(1 for t in tokens if t.get("trades"))
+            log.info("Loaded %d tokens (%d with trades) from %s", len(tokens), has_trades, os.path.basename(fp))
+            all_tokens.extend(tokens)
+
+        for fp in collect_files:
+            with open(fp) as f:
+                data = json.load(f)
+            tokens = data.get("tokens", [])
+            has_trades = sum(1 for t in tokens if t.get("trades"))
+            log.info("Loaded %d tokens (%d with trades) from %s", len(tokens), has_trades, os.path.basename(fp))
+            all_tokens.extend(tokens)
 
     log.info("Total raw tokens loaded: %d", len(all_tokens))
 
@@ -530,11 +537,16 @@ def backtest(df, model, scaler, features):
 
 
 def main():
-    data_dir = sys.argv[1] if len(sys.argv) > 1 else None
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file", "-f", help="Specific data file to load")
+    parser.add_argument("data_dir", nargs="?", default=None, help="Data directory")
+    args = parser.parse_args()
+
     random.seed(42)
     np.random.seed(42)
 
-    df = load_and_prepare(data_dir)
+    df = load_and_prepare(data_dir=args.data_dir, data_file=args.file)
     if len(df) == 0:
         log.error("No valid training data!")
         sys.exit(1)
