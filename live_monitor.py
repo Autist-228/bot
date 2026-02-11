@@ -837,6 +837,86 @@ async def report_printer():
         log.info("\n%s", report)
 
 
+INCREMENTAL_INTERVAL = 600
+incremental_trained_mints: set[str] = set()
+
+
+async def incremental_learner():
+    global entry_model, exit_model
+    while True:
+        await asyncio.sleep(INCREMENTAL_INTERVAL)
+        closed = [s for s in signals if s["status"] == "CLOSED" and s["mint"] not in incremental_trained_mints]
+        if len(closed) < 3:
+            log.info("INCREMENTAL: only %d new closed signals, need >=3, skipping", len(closed))
+            continue
+
+        log.info("INCREMENTAL: feeding %d closed signals to model...", len(closed))
+        entry_X_list = []
+        entry_y_list = []
+        entry_w_list = []
+
+        for sig in closed:
+            incremental_trained_mints.add(sig["mint"])
+            mint = sig["mint"]
+            token_data = tokens.get(mint, {})
+            values = []
+            for f in FEATURES:
+                v = token_data.get(f, 0)
+                values.append(float(v) if v else 0.0)
+
+            final_pnl = sig.get("close_pnl_pct", 0) or 0
+            peak = sig.get("peak_gain", 0) or 0
+            is_profitable = 1.0 if final_pnl >= 5.0 else 0.0
+
+            if peak >= 100:
+                weight = 5.0
+            elif peak >= 50:
+                weight = 4.0
+            elif peak >= 20:
+                weight = 3.0
+            elif final_pnl < -10:
+                weight = 3.0
+            elif peak >= 5:
+                weight = 2.0
+            else:
+                weight = 1.0
+
+            entry_X_list.append(values)
+            entry_y_list.append(is_profitable)
+            entry_w_list.append(weight)
+
+        if not entry_X_list or entry_model is None:
+            continue
+
+        X = np.array(entry_X_list, dtype=np.float32)
+        y = np.array(entry_y_list, dtype=np.float32)
+        w = np.array(entry_w_list, dtype=np.float32)
+        X_n = (X - entry_mean) / entry_std
+
+        X_t = torch.from_numpy(X_n)
+        y_t = torch.from_numpy(y)
+        w_t = torch.from_numpy(w)
+
+        entry_model.train()
+        optimizer = torch.optim.Adam(entry_model.parameters(), lr=1e-4, weight_decay=1e-4)
+        for epoch in range(10):
+            optimizer.zero_grad()
+            pred = entry_model(X_t)
+            bce = torch.nn.functional.binary_cross_entropy(pred, y_t, reduction="none")
+            loss = (w_t * bce).mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(entry_model.parameters(), 1.0)
+            optimizer.step()
+        entry_model.eval()
+
+        wins = int(y.sum())
+        total = len(y)
+        log.info(
+            "INCREMENTAL: trained on %d signals (%d wins, %.0f%%) | loss=%.4f",
+            total, wins, wins / total * 100, loss.item(),
+        )
+
+
 async def main():
     duration = int(os.getenv("MONITOR_DURATION", "1800"))
     log.info("=" * 60)
@@ -883,6 +963,7 @@ async def main():
         price_updater = asyncio.create_task(signal_price_updater())
         enricher = asyncio.create_task(enrich_batch(client))
         reporter = asyncio.create_task(report_printer())
+        learner = asyncio.create_task(incremental_learner())
 
         await asyncio.sleep(duration)
 
@@ -892,6 +973,7 @@ async def main():
         listener.cancel()
         scanner.cancel()
         enricher.cancel()
+        learner.cancel()
 
         track_extra = 120
         await asyncio.sleep(track_extra)
