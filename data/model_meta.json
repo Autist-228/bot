@@ -1,34 +1,32 @@
 {
-  "trained_at": "2026-02-11T01:11:41.346460+00:00",
+  "trained_at": "2026-02-11T01:56:21.096699+00:00",
   "model_type": "rf",
-  "n_samples": 28327,
-  "n_features": 15,
+  "n_samples": 30241,
+  "n_features": 10,
   "features": [
     "initial_buy_sol",
-    "initial_price_usd",
     "initial_mcap_usd",
+    "entry_price_usd",
     "v_sol_in_bonding",
     "v_tokens_in_bonding",
-    "total_buys",
-    "total_sells",
-    "total_buy_sol",
-    "total_sell_sol",
-    "buy_sell_ratio",
-    "sell_pressure",
-    "unique_buyers",
-    "unique_sellers",
-    "trade_count",
+    "momentum_15_30",
+    "momentum_30_60",
+    "price_range_ratio",
+    "has_early_activity",
     "migrated"
   ],
   "label_map": {
     "3": "ROCKET",
     "2": "winner",
     "1": "good",
-    "0": "dead"
+    "0": "trash"
   },
-  "data_sources": [
-    "historical_12h",
-    "sessions_1-4",
-    "sosok1337"
-  ]
+  "sim_config": {
+    "entry_snapshot": "60s",
+    "cost_roundtrip": 0.9317,
+    "stop_loss": -15.0,
+    "trailing_stop": 15.0,
+    "time_stop_sec": 60,
+    "time_stop_min_gain": 10.0
+  }
 }

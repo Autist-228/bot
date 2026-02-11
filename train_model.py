@@ -13,235 +13,277 @@ from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.preprocessing import StandardScaler
 import joblib
 
-from config import DATA_DIR
+from config import (
+    DATA_DIR,
+    PUMPFUN_FEE_PCT,
+    BUY_SLIPPAGE_PCT,
+    SELL_SLIPPAGE_PCT,
+    STOP_LOSS_PCT,
+    TRAILING_STOP_PCT,
+    TIME_STOP_SEC,
+    TIME_STOP_MIN_GAIN,
+    BET_SIZE_USD,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("trainer")
 
 FEATURES = [
     "initial_buy_sol",
-    "initial_price_usd",
     "initial_mcap_usd",
+    "entry_price_usd",
     "v_sol_in_bonding",
     "v_tokens_in_bonding",
-    "total_buys",
-    "total_sells",
-    "total_buy_sol",
-    "total_sell_sol",
-    "buy_sell_ratio",
-    "sell_pressure",
-    "unique_buyers",
-    "unique_sellers",
-    "dex_liquidity_usd",
-    "dex_volume_5m",
-    "dex_volume_1h",
-    "dex_buys_5m",
-    "dex_sells_5m",
-    "dex_buys_1h",
-    "dex_sells_1h",
-    "dex_market_cap",
-    "dex_fdv",
-    "has_website",
-    "has_socials",
+    "momentum_15_30",
+    "momentum_30_60",
+    "price_range_ratio",
+    "has_early_activity",
     "migrated",
 ]
 
-LABEL_MAP = {
-    "ROCKET": 3,
-    "winner": 2,
-    "good": 1,
-    "flat": 0,
-    "loser": 0,
-    "dead": 0,
-}
+LABEL_MAP = {"ROCKET": 3, "winner": 2, "good": 1, "trash": 0}
+
+COST_BUY = (1 - PUMPFUN_FEE_PCT) * (1 - BUY_SLIPPAGE_PCT)
+COST_SELL = (1 - PUMPFUN_FEE_PCT) * (1 - SELL_SLIPPAGE_PCT)
+COST_ROUNDTRIP = COST_BUY * COST_SELL
+
+ENTRY_SNAPSHOT = "60s"
+EXIT_SNAPSHOTS = ["120s", "300s", "600s", "900s"]
+ENTRY_AGE = 60
 
 
-def load_data(data_dir: str | None = None) -> pd.DataFrame:
+def simulate_trade(token):
+    snapshots = token.get("snapshots", {})
+    entry_snap = snapshots.get(ENTRY_SNAPSHOT, {})
+    entry_price = entry_snap.get("price_usd", 0)
+    if entry_price <= 0:
+        return -100.0, "NO_ENTRY_PRICE"
+    peak_gain = 0.0
+    last_gain = 0.0
+    for snap_key in EXIT_SNAPSHOTS:
+        snap = snapshots.get(snap_key, {})
+        price = snap.get("price_usd", 0)
+        if price <= 0:
+            continue
+        gross_change_pct = (price / entry_price - 1) * 100
+        net_gain = (COST_ROUNDTRIP * (1 + gross_change_pct / 100) - 1) * 100
+        last_gain = net_gain
+        if net_gain > peak_gain:
+            peak_gain = net_gain
+        snap_age = snap.get("age_sec", 0)
+        elapsed = snap_age - ENTRY_AGE
+        if net_gain <= STOP_LOSS_PCT:
+            return net_gain, "STOP_LOSS"
+        if elapsed >= TIME_STOP_SEC and net_gain < TIME_STOP_MIN_GAIN:
+            return net_gain, "TIME_STOP"
+        if peak_gain >= 30.0 and (peak_gain - net_gain) >= TRAILING_STOP_PCT:
+            return net_gain, "TRAILING_STOP"
+        if peak_gain >= 15.0 and net_gain < 0:
+            return net_gain, "PROFIT_GONE"
+    return last_gain, "HOLD_END"
+
+
+def pnl_to_label(pnl):
+    if pnl >= 30:
+        return "ROCKET"
+    if pnl >= 10:
+        return "winner"
+    if pnl >= 0:
+        return "good"
+    return "trash"
+
+
+def extract_early_features(token):
+    snapshots = token.get("snapshots", {})
+    p15 = snapshots.get("15s", {}).get("price_usd", 0)
+    p30 = snapshots.get("30s", {}).get("price_usd", 0)
+    p60 = snapshots.get("60s", {}).get("price_usd", 0)
+    mom_15_30 = ((p30 / p15) - 1) * 100 if p15 > 0 and p30 > 0 else 0.0
+    mom_30_60 = ((p60 / p30) - 1) * 100 if p30 > 0 and p60 > 0 else 0.0
+    prices = [p for p in [p15, p30, p60] if p > 0]
+    if len(prices) >= 2:
+        price_range_ratio = max(prices) / min(prices)
+    else:
+        price_range_ratio = 1.0
+    has_activity = 1 if len(set(prices)) > 1 else 0
+    return {
+        "initial_buy_sol": token.get("initial_buy_sol", 0),
+        "initial_mcap_usd": token.get("initial_mcap_usd", 0),
+        "entry_price_usd": p60,
+        "v_sol_in_bonding": token.get("v_sol_in_bonding", 0),
+        "v_tokens_in_bonding": token.get("v_tokens_in_bonding", 0),
+        "momentum_15_30": mom_15_30,
+        "momentum_30_60": mom_30_60,
+        "price_range_ratio": price_range_ratio,
+        "has_early_activity": has_activity,
+        "migrated": int(token.get("migrated", 0)),
+    }
+
+
+def load_and_prepare(data_dir=None):
     directory = data_dir or DATA_DIR
-    files = sorted(glob.glob(os.path.join(directory, "collect_*.json")))
-    files += sorted(glob.glob(os.path.join(directory, "*.jsonl")))
-    if not files:
-        log.error("No data files found in %s", directory)
-        sys.exit(1)
-
+    hist_files = sorted(glob.glob(os.path.join(directory, "historical_progress_*.json")))
+    collect_files = sorted(glob.glob(os.path.join(directory, "collect_*.json")))
+    jsonl_files = sorted(glob.glob(os.path.join(directory, "*.jsonl")))
     all_tokens = []
-    for fp in files:
+    for fp in hist_files:
         with open(fp) as f:
-            if fp.endswith(".jsonl"):
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    data = json.loads(line)
-                    tokens = data.get("tokens", [])
-                    log.info("Loaded %d tokens from %s", len(tokens), os.path.basename(fp))
-                    all_tokens.extend(tokens)
-            else:
-                data = json.load(f)
+            data = json.load(f)
+        tokens = data.get("tokens", [])
+        log.info("Loaded %d tokens from %s", len(tokens), os.path.basename(fp))
+        all_tokens.extend(tokens)
+    for fp in collect_files:
+        with open(fp) as f:
+            data = json.load(f)
+        tokens = data.get("tokens", [])
+        log.info("Loaded %d tokens from %s", len(tokens), os.path.basename(fp))
+        all_tokens.extend(tokens)
+    for fp in jsonl_files:
+        with open(fp) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
                 tokens = data.get("tokens", [])
                 log.info("Loaded %d tokens from %s", len(tokens), os.path.basename(fp))
                 all_tokens.extend(tokens)
-
-    log.info("Total tokens loaded: %d", len(all_tokens))
-
-    df = pd.DataFrame(all_tokens)
-
-    if "best_change_pct" in df.columns:
-        log.info("Re-deriving outcomes from best_change_pct with new thresholds...")
-        df["outcome"] = df["best_change_pct"].apply(
-            lambda x: "ROCKET" if x >= 500
-            else "winner" if x >= 100
-            else "good" if x >= 50
-            else "flat" if x >= -15
-            else "loser" if x >= -50
-            else "dead"
-        )
-
-    df = df[df["outcome"].isin(LABEL_MAP.keys())].copy()
-    log.info("Tokens with valid outcome: %d", len(df))
-
-    if "total_buys" in df.columns:
-        before = len(df)
-        df = df[df["total_buys"] >= 1].copy()
-        log.info("Tokens with at least 1 buy: %d / %d", len(df), before)
-
+    log.info("Total raw tokens loaded: %d", len(all_tokens))
+    seen_mints = set()
+    unique_tokens = []
+    for t in all_tokens:
+        mint = t.get("mint", "")
+        if mint and mint not in seen_mints:
+            seen_mints.add(mint)
+            unique_tokens.append(t)
+    log.info("Unique tokens (deduped): %d", len(unique_tokens))
+    rows = []
+    sim_stats = {"total": 0, "no_entry": 0, "simulated": 0}
+    exit_reasons = {}
+    pnl_labels = {"ROCKET": 0, "winner": 0, "good": 0, "trash": 0}
+    for token in unique_tokens:
+        snapshots = token.get("snapshots", {})
+        if not snapshots or "60s" not in snapshots:
+            sim_stats["no_entry"] += 1
+            continue
+        entry_price = snapshots["60s"].get("price_usd", 0)
+        if entry_price <= 0:
+            sim_stats["no_entry"] += 1
+            continue
+        sim_stats["total"] += 1
+        pnl, reason = simulate_trade(token)
+        sim_stats["simulated"] += 1
+        exit_reasons[reason] = exit_reasons.get(reason, 0) + 1
+        outcome = pnl_to_label(pnl)
+        pnl_labels[outcome] += 1
+        features = extract_early_features(token)
+        features["sim_pnl"] = pnl
+        features["sim_exit_reason"] = reason
+        features["outcome"] = outcome
+        features["mint"] = token.get("mint", "")
+        features["symbol"] = token.get("symbol", "")
+        features["created_ts"] = token.get("created_ts", 0)
+        rows.append(features)
+    log.info("Simulation stats: %s", sim_stats)
+    log.info("Exit reasons: %s", exit_reasons)
+    log.info("P&L labels: %s", pnl_labels)
+    df = pd.DataFrame(rows)
     df["label"] = df["outcome"].map(LABEL_MAP)
-
-    for col in ["has_website", "has_socials", "migrated"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-
     for col in FEATURES:
         if col not in df.columns:
             df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
     return df
 
 
-def analyze_patterns(df: pd.DataFrame):
+def analyze_patterns(df):
     log.info("=" * 60)
-    log.info("PATTERN ANALYSIS")
+    log.info("PATTERN ANALYSIS (simulation-based labels)")
     log.info("=" * 60)
-
     outcome_counts = df["outcome"].value_counts()
     log.info("Outcome distribution:\n%s", outcome_counts.to_string())
-
     rockets = df[df["outcome"] == "ROCKET"]
-    winners = df[df["outcome"] == "winner"]
-    good = df[df["outcome"] == "good"]
-    trash = df[df["outcome"].isin(["flat", "loser", "dead"])]
-
-    log.info("\n--- ROCKET vs TRASH comparison ---")
+    trash = df[df["outcome"] == "trash"]
+    log.info("\n--- ROCKET vs TRASH feature comparison ---")
     compare_cols = [
-        "initial_buy_sol", "initial_mcap_usd", "total_buys", "total_sells",
-        "buy_sell_ratio", "sell_pressure", "dex_liquidity_usd",
-        "dex_volume_5m", "migrated",
+        "initial_buy_sol", "initial_mcap_usd", "entry_price_usd",
+        "momentum_15_30", "momentum_30_60", "price_range_ratio",
+        "has_early_activity", "migrated",
     ]
-
     for col in compare_cols:
-        r_mean = rockets[col].mean() if len(rockets) > 0 else 0
-        t_mean = trash[col].mean() if len(trash) > 0 else 0
-        log.info(
-            "  %s: ROCKET=%.4f  TRASH=%.4f  (%.1fx)",
-            col.ljust(25), r_mean, t_mean,
-            r_mean / max(t_mean, 0.0001),
-        )
-
-    if len(rockets) > 0:
-        log.info("\n--- ROCKET tokens details ---")
-        for _, r in rockets.iterrows():
+        r_med = rockets[col].median() if len(rockets) > 0 else 0
+        t_med = trash[col].median() if len(trash) > 0 else 0
+        log.info("  %s: ROCKET_med=%.4f  TRASH_med=%.4f", col.ljust(25), r_med, t_med)
+    log.info("\n--- Simulated P&L stats ---")
+    for grp_name in ["ROCKET", "winner", "good", "trash"]:
+        grp = df[df["outcome"] == grp_name]
+        if len(grp) > 0:
+            pnl = grp["sim_pnl"]
             log.info(
-                "  %s: buys=%d sells=%d ratio=%.1f sell_pres=%.0f%% mcap=$%.0f change=%.0f%%",
-                r["symbol"], r["total_buys"], r["total_sells"],
-                r["buy_sell_ratio"], r["sell_pressure"],
-                r["initial_mcap_usd"], r.get("best_change_pct", 0) or 0,
+                "  %s: count=%d mean_pnl=%+.1f%% median=%+.1f%% min=%+.1f%% max=%+.1f%%",
+                grp_name.ljust(8), len(grp), pnl.mean(), pnl.median(), pnl.min(), pnl.max(),
             )
-
-    log.info("\n--- Quick rules analysis ---")
-    if len(rockets) > 0 and len(trash) > 0:
-        buy_threshold = rockets["total_buys"].quantile(0.25)
-        sell_pressure_threshold = rockets["sell_pressure"].quantile(0.75)
-        log.info("  Rule 1: total_buys >= %.0f (catches 75%% of rockets)", buy_threshold)
-        log.info("  Rule 2: sell_pressure <= %.0f%% (catches 75%% of rockets)", sell_pressure_threshold)
-
-        rule_hits = df[
-            (df["total_buys"] >= buy_threshold) &
-            (df["sell_pressure"] <= sell_pressure_threshold)
-        ]
-        rule_rockets = rule_hits[rule_hits["outcome"] == "ROCKET"]
-        precision = len(rule_rockets) / max(1, len(rule_hits)) * 100
-        recall = len(rule_rockets) / max(1, len(rockets)) * 100
-        log.info("  Combined rule: precision=%.0f%% recall=%.0f%%", precision, recall)
+    if "sim_exit_reason" in df.columns:
+        log.info("\nExit reasons by outcome:")
+        for outcome in ["ROCKET", "winner", "good", "trash"]:
+            grp = df[df["outcome"] == outcome]
+            if len(grp) > 0:
+                reasons = grp["sim_exit_reason"].value_counts()
+                log.info("  %s: %s", outcome, dict(reasons))
 
 
-def train(df: pd.DataFrame, model_type: str = "rf"):
+def train(df, model_type="rf"):
     log.info("=" * 60)
-    log.info("ML TRAINING")
+    log.info("ML TRAINING (simulation-based)")
     log.info("=" * 60)
-
     available_features = [f for f in FEATURES if f in df.columns]
     X = df[available_features].values
     y = df["label"].values
-
-    log.info("Features: %d | Samples: %d", len(available_features), len(X))
+    log.info("Features (%d): %s", len(available_features), available_features)
+    log.info("Samples: %d", len(X))
     log.info("Label distribution: %s", dict(zip(*np.unique(y, return_counts=True))))
-
     if len(np.unique(y)) < 2:
-        log.warning("Not enough label variety to train. Need at least 2 classes.")
+        log.warning("Not enough label variety to train.")
         return None, None, None
-
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-
     if model_type == "rf":
         model = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=10,
-            min_samples_leaf=3,
-            class_weight="balanced",
-            random_state=42,
+            n_estimators=300, max_depth=12, min_samples_leaf=5,
+            class_weight="balanced", random_state=42,
         )
     else:
         model = GradientBoostingClassifier(
-            n_estimators=200,
-            max_depth=5,
-            min_samples_leaf=3,
-            random_state=42,
+            n_estimators=300, max_depth=6, min_samples_leaf=5, random_state=42,
         )
-
-    if len(X) >= 20:
-        cv_scores = cross_val_score(model, X_scaled, y, cv=min(5, len(X) // 4), scoring="f1_weighted")
+    if len(X) >= 50:
+        cv_scores = cross_val_score(
+            model, X_scaled, y, cv=min(5, len(X) // 10), scoring="f1_weighted",
+        )
         log.info("Cross-val F1 (weighted): %.3f (+/- %.3f)", cv_scores.mean(), cv_scores.std())
-
     X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y, test_size=0.2, random_state=42, stratify=y if len(np.unique(y)) >= 2 else None,
+        X_scaled, y, test_size=0.2, random_state=42,
+        stratify=y if len(np.unique(y)) >= 2 else None,
     )
-
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
-
     labels = sorted(np.unique(y))
     label_names = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}
     target_names = [label_names.get(l, f"class_{l}") for l in labels]
-
-    log.info("\nClassification Report:\n%s", classification_report(y_test, y_pred, target_names=target_names, zero_division=0))
+    log.info("\nClassification Report:\n%s",
+             classification_report(y_test, y_pred, target_names=target_names, zero_division=0))
     log.info("Confusion Matrix:\n%s", confusion_matrix(y_test, y_pred))
-
     importances = model.feature_importances_
     sorted_idx = np.argsort(importances)[::-1]
-    log.info("\nTop 10 Feature Importances:")
-    for i in range(min(10, len(sorted_idx))):
+    log.info("\nFeature Importances:")
+    for i in range(len(sorted_idx)):
         idx = sorted_idx[i]
         log.info("  %s: %.4f", available_features[idx].ljust(25), importances[idx])
-
     model_path = os.path.join(DATA_DIR, "model.pkl")
     scaler_path = os.path.join(DATA_DIR, "scaler.pkl")
     meta_path = os.path.join(DATA_DIR, "model_meta.json")
-
     joblib.dump(model, model_path)
     joblib.dump(scaler, scaler_path)
-
     meta = {
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "model_type": model_type,
@@ -249,45 +291,73 @@ def train(df: pd.DataFrame, model_type: str = "rf"):
         "n_features": len(available_features),
         "features": available_features,
         "label_map": {v: k for k, v in LABEL_MAP.items()},
+        "sim_config": {
+            "entry_snapshot": ENTRY_SNAPSHOT,
+            "cost_roundtrip": round(COST_ROUNDTRIP, 4),
+            "stop_loss": STOP_LOSS_PCT,
+            "trailing_stop": TRAILING_STOP_PCT,
+            "time_stop_sec": TIME_STOP_SEC,
+            "time_stop_min_gain": TIME_STOP_MIN_GAIN,
+        },
     }
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
-
     log.info("Model saved: %s", model_path)
     log.info("Scaler saved: %s", scaler_path)
-
     return model, scaler, available_features
 
 
-def predict_token(model, scaler, features: list[str], token_data: dict) -> str:
-    values = [token_data.get(f, 0) for f in features]
-    for i, f in enumerate(features):
-        if f in ("has_website", "has_socials", "migrated"):
-            values[i] = int(values[i])
-    X = np.array([values])
-    X_scaled = scaler.transform(X)
-    pred = model.predict(X_scaled)[0]
-    proba = model.predict_proba(X_scaled)[0]
-
-    label = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}.get(pred, "unknown")
-    confidence = max(proba) * 100
-    return f"{label} ({confidence:.0f}%)"
+def backtest(df, model, scaler, features):
+    log.info("=" * 60)
+    log.info("BACKTEST (time-based split)")
+    log.info("=" * 60)
+    if "created_ts" not in df.columns or df["created_ts"].max() == 0:
+        log.info("No timestamp data for time-based backtest, skipping")
+        return
+    df_sorted = df.sort_values("created_ts").copy()
+    split_idx = int(len(df_sorted) * 0.9)
+    test_df = df_sorted.iloc[split_idx:]
+    log.info("Train: %d tokens | Test: %d tokens (last 10%%)", split_idx, len(test_df))
+    X_test = test_df[features].values
+    X_scaled = scaler.transform(X_test)
+    y_true = test_df["label"].values
+    y_pred = model.predict(X_scaled)
+    labels = sorted(np.unique(y_true))
+    label_names = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}
+    target_names = [label_names.get(l, f"class_{l}") for l in labels]
+    log.info("\nBacktest Classification Report:\n%s",
+             classification_report(y_true, y_pred, target_names=target_names, zero_division=0))
+    actual_pnls = test_df["sim_pnl"].values
+    for pred_label, pred_name in [(3, "ROCKET"), (2, "winner")]:
+        mask = y_pred >= pred_label if pred_label == 2 else y_pred == pred_label
+        if mask.sum() > 0:
+            pnls = actual_pnls[mask]
+            wins = (pnls > 0).sum()
+            total = len(pnls)
+            avg_pnl = pnls.mean()
+            total_pnl_usd = sum(BET_SIZE_USD * p / 100 for p in pnls)
+            name = pred_name if pred_label == 3 else "ROCKET+winner"
+            log.info(
+                "%s signals: %d | Win rate: %.1f%% (%d/%d) | Avg P&L: %+.1f%% | Total: $%+.2f",
+                name, total, wins / total * 100, wins, total, avg_pnl, total_pnl_usd,
+            )
 
 
 def main():
     data_dir = sys.argv[1] if len(sys.argv) > 1 else None
-    df = load_data(data_dir)
-
+    df = load_and_prepare(data_dir)
+    if len(df) == 0:
+        log.error("No valid training data!")
+        sys.exit(1)
     analyze_patterns(df)
-
     model, scaler, features = train(df)
-
     if model is not None:
+        backtest(df, model, scaler, features)
         log.info("=" * 60)
         log.info("TRAINING COMPLETE")
         log.info("=" * 60)
     else:
-        log.info("Not enough data to train. Collect more tokens!")
+        log.info("Not enough data to train!")
 
 
 if __name__ == "__main__":

@@ -233,6 +233,17 @@ async def ml_scanner(client: httpx.AsyncClient):
                 token["ml_checked"] = True
                 continue
 
+            v_sol = token.get("v_sol_in_bonding", 0)
+            v_tokens = token.get("v_tokens_in_bonding", 0)
+            cur_price = bonding_curve_price_usd(v_sol, v_tokens)
+            p15 = token.get("price_snap_15s", 0)
+            p30 = token.get("price_snap_30s", 0)
+            token["entry_price_usd"] = cur_price
+            token["momentum_15_30"] = ((p30 / p15) - 1) * 100 if p15 > 0 and p30 > 0 else 0.0
+            token["momentum_30_60"] = ((cur_price / p30) - 1) * 100 if p30 > 0 and cur_price > 0 else 0.0
+            prices = [p for p in [p15, p30, cur_price] if p > 0]
+            token["price_range_ratio"] = max(prices) / min(prices) if len(prices) >= 2 else 1.0
+            token["has_early_activity"] = 1 if len(set(prices)) > 1 else 0
             token["total_buys"] = buys
             token["total_sells"] = sells
             token["total_buy_sol"] = tc.get("buy_sol", 0)
@@ -561,19 +572,11 @@ async def listen_pumpportal():
                         "enriched": False,
                         "enrich_tried": False,
                         "dex_liquidity_usd": 0,
-                        "dex_volume_5m": 0,
-                        "dex_volume_1h": 0,
-                        "dex_buys_5m": 0,
-                        "dex_sells_5m": 0,
-                        "dex_buys_1h": 0,
-                        "dex_sells_1h": 0,
-                        "dex_market_cap": 0,
-                        "dex_fdv": 0,
-                        "has_website": False,
-                        "has_socials": False,
                         "ml_checked": False,
                         "ml_label": None,
                         "ml_confidence": None,
+                        "price_snap_15s": 0.0,
+                        "price_snap_30s": 0.0,
                     }
 
                     trade_counts[mint] = {
@@ -627,6 +630,13 @@ async def listen_pumpportal():
                             tokens[mint]["v_sol_in_bonding"] = new_v_sol
                         if new_v_tokens > 0:
                             tokens[mint]["v_tokens_in_bonding"] = new_v_tokens
+                        token_age = time.time() - tokens[mint]["created_ts"]
+                        cur_price = bonding_curve_price_usd(new_v_sol, new_v_tokens) if new_v_sol > 0 and new_v_tokens > 0 else 0
+                        if cur_price > 0:
+                            if token_age >= 15 and tokens[mint]["price_snap_15s"] == 0.0:
+                                tokens[mint]["price_snap_15s"] = cur_price
+                            if token_age >= 30 and tokens[mint]["price_snap_30s"] == 0.0:
+                                tokens[mint]["price_snap_30s"] = cur_price
 
                     for sig in signals:
                         if sig["mint"] == mint and sig["status"] == "ACTIVE":
