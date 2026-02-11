@@ -1,8 +1,8 @@
 {
-  "trained_at": "2026-02-10T22:17:32.323410+00:00",
+  "trained_at": "2026-02-11T01:11:41.346460+00:00",
   "model_type": "rf",
-  "n_samples": 1970,
-  "n_features": 25,
+  "n_samples": 28327,
+  "n_features": 15,
   "features": [
     "initial_buy_sol",
     "initial_price_usd",
@@ -17,17 +17,7 @@
     "sell_pressure",
     "unique_buyers",
     "unique_sellers",
-    "dex_liquidity_usd",
-    "dex_volume_5m",
-    "dex_volume_1h",
-    "dex_buys_5m",
-    "dex_sells_5m",
-    "dex_buys_1h",
-    "dex_sells_1h",
-    "dex_market_cap",
-    "dex_fdv",
-    "has_website",
-    "has_socials",
+    "trade_count",
     "migrated"
   ],
   "label_map": {
@@ -35,5 +25,10 @@
     "2": "winner",
     "1": "good",
     "0": "dead"
-  }
+  },
+  "data_sources": [
+    "historical_12h",
+    "sessions_1-4",
+    "sosok1337"
+  ]
 }
