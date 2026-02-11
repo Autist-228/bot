@@ -30,6 +30,7 @@ from config import (
 )
 
 REAL_TRADING = "--real" in sys.argv
+CONTINUOUS = "--continuous" in sys.argv
 trader = None
 
 logging.basicConfig(
@@ -52,6 +53,11 @@ tokens: dict[str, dict] = {}
 trade_counts: dict[str, dict] = {}
 signals: list[dict] = []
 stats = {"total": 0, "enriched": 0, "trades": 0, "signals": 0, "start": 0}
+
+missed_tokens: list[dict] = []
+missed_trained_mints: set[str] = set()
+MISSED_CHECK_DELAY = 900
+MISSED_PUMP_THRESHOLD = 50.0
 
 SOL_PRICE_USD = 200.0
 entry_model = None
@@ -262,6 +268,17 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["ml_checked"] = True
             token["ml_label"] = label
             token["ml_confidence"] = confidence
+
+            if label == "trash" and buys >= MIN_BUYS_FOR_SIGNAL:
+                feat_snap = [float(token.get(f, 0) or 0) for f in FEATURES]
+                missed_tokens.append({
+                    "mint": mint,
+                    "symbol": token["symbol"],
+                    "features": feat_snap,
+                    "eval_ts": now,
+                    "entry_v_sol": v_sol,
+                    "entry_v_tokens": v_tokens,
+                })
 
             if confidence >= 25 or debug_count[0] < 10:
                 debug_count[0] += 1
@@ -841,6 +858,86 @@ async def report_printer():
 
 INCREMENTAL_INTERVAL = 600
 incremental_trained_mints: set[str] = set()
+resolved_missed: list[dict] = []
+MEMORY_CLEANUP_INTERVAL = 1800
+TOKEN_MAX_AGE = 1800
+
+
+def calc_missed_pnl(entry_v_sol, entry_v_tokens, cur_v_sol, cur_v_tokens):
+    if entry_v_sol <= 0 or entry_v_tokens <= 0:
+        return None
+    if cur_v_sol <= 0 or cur_v_tokens <= 0:
+        return None
+    sol_amount = BET_SIZE_USD / SOL_PRICE_USD
+    sol_after_fee = sol_amount * (1 - PUMPFUN_FEE_PCT)
+    sol_effective = sol_after_fee * (1 - BUY_SLIPPAGE_PCT)
+    k_buy = entry_v_sol * entry_v_tokens
+    new_v_sol_buy = entry_v_sol + sol_effective
+    new_v_tokens_buy = k_buy / new_v_sol_buy
+    sim_tokens = entry_v_tokens - new_v_tokens_buy
+    if sim_tokens <= 0:
+        return None
+    k_sell = cur_v_sol * cur_v_tokens
+    vt_after_sell = cur_v_tokens + sim_tokens
+    vs_after_sell = k_sell / vt_after_sell
+    gross_out = cur_v_sol - vs_after_sell
+    net_out = gross_out * (1 - PUMPFUN_FEE_PCT) * (1 - SELL_SLIPPAGE_PCT)
+    return ((net_out / sol_amount) - 1) * 100
+
+
+async def missed_token_checker():
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        pending = [m for m in missed_tokens
+                   if m["mint"] not in missed_trained_mints
+                   and now - m["eval_ts"] >= MISSED_CHECK_DELAY]
+        if not pending:
+            continue
+
+        checked = 0
+        rockets = 0
+        for mt in pending:
+            missed_trained_mints.add(mt["mint"])
+            token_data = tokens.get(mt["mint"])
+            if not token_data:
+                continue
+            cur_v_sol = token_data.get("v_sol_in_bonding", 0)
+            cur_v_tokens = token_data.get("v_tokens_in_bonding", 0)
+            hyp_pnl = calc_missed_pnl(
+                mt["entry_v_sol"], mt["entry_v_tokens"],
+                cur_v_sol, cur_v_tokens,
+            )
+            if hyp_pnl is None:
+                continue
+            checked += 1
+            is_profitable = 1.0 if hyp_pnl >= MISSED_PUMP_THRESHOLD else 0.0
+            if hyp_pnl >= 100:
+                weight = 5.0
+            elif hyp_pnl >= MISSED_PUMP_THRESHOLD:
+                weight = 4.0
+            elif hyp_pnl <= -10:
+                weight = 1.5
+            else:
+                weight = 1.0
+            resolved_missed.append({
+                "features": mt["features"],
+                "label": is_profitable,
+                "weight": weight,
+                "pnl": hyp_pnl,
+                "symbol": mt["symbol"],
+            })
+            if is_profitable > 0:
+                rockets += 1
+                log.info(
+                    "MISSED ROCKET: %s hypothetical PNL=+%.0f%% (w=%.1f)",
+                    mt["symbol"], hyp_pnl, weight,
+                )
+        if checked > 0:
+            log.info(
+                "MISSED CHECK: %d tokens resolved, %d were rockets, %d confirmed trash",
+                checked, rockets, checked - rockets,
+            )
 
 
 async def incremental_learner():
@@ -848,11 +945,7 @@ async def incremental_learner():
     while True:
         await asyncio.sleep(INCREMENTAL_INTERVAL)
         closed = [s for s in signals if s["status"] == "CLOSED" and s["mint"] not in incremental_trained_mints]
-        if len(closed) < 3:
-            log.info("INCREMENTAL: only %d new closed signals, need >=3, skipping", len(closed))
-            continue
 
-        log.info("INCREMENTAL: feeding %d closed signals to model...", len(closed))
         entry_X_list = []
         entry_y_list = []
         entry_w_list = []
@@ -867,7 +960,6 @@ async def incremental_learner():
                 values.append(float(v) if v else 0.0)
 
             final_pnl = sig.get("close_pnl_pct", 0) or 0
-            peak = sig.get("peak_gain", 0) or 0
             is_profitable = 1.0 if final_pnl >= 5.0 else 0.0
 
             if final_pnl >= 50:
@@ -885,7 +977,22 @@ async def incremental_learner():
             entry_y_list.append(is_profitable)
             entry_w_list.append(weight)
 
-        if not entry_X_list or entry_model is None:
+        while resolved_missed:
+            rm = resolved_missed.pop(0)
+            entry_X_list.append(rm["features"])
+            entry_y_list.append(rm["label"])
+            entry_w_list.append(rm["weight"])
+
+        total = len(entry_X_list)
+        if total < 3:
+            log.info("INCREMENTAL: only %d samples (signals+missed), need >=3, skipping", total)
+            continue
+
+        n_signals = len(closed)
+        n_missed = total - n_signals
+        log.info("INCREMENTAL: feeding %d samples (%d signals + %d missed) to model...", total, n_signals, n_missed)
+
+        if entry_model is None:
             continue
 
         X = np.array(entry_X_list, dtype=np.float32)
@@ -910,9 +1017,8 @@ async def incremental_learner():
         entry_model.eval()
 
         wins = int(y.sum())
-        total = len(y)
         log.info(
-            "INCREMENTAL: trained on %d signals (%d wins, %.0f%%) | loss=%.4f",
+            "INCREMENTAL: trained on %d samples (%d wins, %.0f%%) | loss=%.4f",
             total, wins, wins / total * 100, loss.item(),
         )
 
@@ -926,12 +1032,45 @@ async def incremental_learner():
         log.info("INCREMENTAL: model saved to %s", entry_path)
 
 
+async def memory_cleanup():
+    while True:
+        await asyncio.sleep(MEMORY_CLEANUP_INTERVAL)
+        now = time.time()
+        signal_mints = {s["mint"] for s in signals if s["status"] == "ACTIVE"}
+        missed_pending = {m["mint"] for m in missed_tokens if m["mint"] not in missed_trained_mints}
+        stale = []
+        for mint, t in tokens.items():
+            if mint in signal_mints or mint in missed_pending:
+                continue
+            last_trade = t.get("last_trade_time", t.get("created_ts", 0))
+            if now - last_trade > TOKEN_MAX_AGE:
+                stale.append(mint)
+        for mint in stale:
+            del tokens[mint]
+            trade_counts.pop(mint, None)
+        if stale:
+            log.info("MEMORY CLEANUP: removed %d stale tokens, %d remain", len(stale), len(tokens))
+
+
+AUTOSAVE_INTERVAL = 3600
+
+
+async def auto_saver():
+    while True:
+        await asyncio.sleep(AUTOSAVE_INTERVAL)
+        try:
+            filepath = save_session()
+            log.info("AUTOSAVE: session saved to %s", filepath)
+        except Exception as e:
+            log.error("AUTOSAVE failed: %s", e)
+
+
 async def main():
     duration = int(os.getenv("MONITOR_DURATION", "1800"))
     log.info("=" * 60)
     mode_str = "REAL TRADING" if REAL_TRADING else "PAPER TRADING"
-    log.info("SOLANA SNIPER BOT V2 [%s]", mode_str)
-    log.info("Duration: %d seconds", duration)
+    run_mode = "CONTINUOUS" if CONTINUOUS else f"{duration}s"
+    log.info("SOLANA SNIPER BOT V2 [%s] [%s]", mode_str, run_mode)
     log.info(
         "Bet: $%.2f | Max slots: %d | Price: bonding curve ONLY",
         BET_SIZE_USD, MAX_SLOTS,
@@ -973,8 +1112,24 @@ async def main():
         enricher = asyncio.create_task(enrich_batch(client))
         reporter = asyncio.create_task(report_printer())
         learner = asyncio.create_task(incremental_learner())
+        missed_checker = asyncio.create_task(missed_token_checker())
+        cleaner = asyncio.create_task(memory_cleanup())
+        saver = asyncio.create_task(auto_saver())
 
-        await asyncio.sleep(duration)
+        if CONTINUOUS:
+            log.info("CONTINUOUS MODE: bot will run until manually stopped (Ctrl+C)")
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+                    log.info(
+                        "HEARTBEAT: uptime=%.1fh tokens=%d signals=%d missed_tracked=%d",
+                        (time.time() - stats["start"]) / 3600,
+                        len(tokens), len(signals), len(missed_tokens),
+                    )
+            except asyncio.CancelledError:
+                log.info("Continuous mode interrupted, shutting down...")
+        else:
+            await asyncio.sleep(duration)
 
         log.info(
             "Signal collection ended. Tracking active positions for 2 more minutes..."
@@ -983,6 +1138,9 @@ async def main():
         scanner.cancel()
         enricher.cancel()
         learner.cancel()
+        missed_checker.cancel()
+        cleaner.cancel()
+        saver.cancel()
 
         track_extra = 120
         await asyncio.sleep(track_extra)
