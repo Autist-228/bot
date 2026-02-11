@@ -913,10 +913,14 @@ async def missed_token_checker():
                 continue
             checked += 1
             is_profitable = 1.0 if hyp_pnl >= MISSED_PUMP_THRESHOLD else 0.0
-            if hyp_pnl >= 100:
+            if hyp_pnl >= 200:
+                weight = 10.0
+            elif hyp_pnl >= 100:
+                weight = 7.0
+            elif hyp_pnl >= 50:
                 weight = 5.0
             elif hyp_pnl >= MISSED_PUMP_THRESHOLD:
-                weight = 4.0
+                weight = 3.0
             elif hyp_pnl <= -10:
                 weight = 1.5
             else:
@@ -963,12 +967,16 @@ async def incremental_learner():
             final_pnl = sig.get("close_pnl_pct", 0) or 0
             is_profitable = 1.0 if final_pnl >= 5.0 else 0.0
 
-            if final_pnl >= 50:
+            if final_pnl >= 200:
+                weight = 10.0
+            elif final_pnl >= 100:
+                weight = 7.0
+            elif final_pnl >= 50:
                 weight = 5.0
             elif final_pnl >= 20:
-                weight = 4.0
-            elif final_pnl >= 5:
                 weight = 3.0
+            elif final_pnl >= 5:
+                weight = 2.0
             elif final_pnl <= -10:
                 weight = 2.0
             else:

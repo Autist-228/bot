@@ -189,12 +189,16 @@ def simulate_trade_with_exits(timeline):
 
 
 def calculate_reward_weight(peak_gain, sim_pnl):
+    if sim_pnl >= 200:
+        return 10.0
+    if sim_pnl >= 100:
+        return 7.0
     if sim_pnl >= 50:
         return 5.0
     if sim_pnl >= 20:
-        return 4.0
-    if sim_pnl >= 5:
         return 3.0
+    if sim_pnl >= 5:
+        return 2.0
     if sim_pnl <= -10:
         return 2.0
     return 1.0
