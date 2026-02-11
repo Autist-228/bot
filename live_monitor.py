@@ -388,6 +388,7 @@ async def ml_scanner(client: httpx.AsyncClient):
                     "sim_v_sol_at_buy": v_sol,
                     "sim_v_tokens_at_buy": v_tokens,
                     "bet_usd": BET_SIZE_USD,
+                    "feature_snapshot": [float(token.get(f, 0) or 0) for f in FEATURES],
                 }
                 signals.append(signal)
                 stats["signals"] += 1
@@ -940,24 +941,24 @@ async def missed_token_checker():
             )
 
 
+pending_samples: list[dict] = []
+
+
 async def incremental_learner():
     global entry_model, exit_model
     while True:
         await asyncio.sleep(INCREMENTAL_INTERVAL)
         closed = [s for s in signals if s["status"] == "CLOSED" and s["mint"] not in incremental_trained_mints]
 
-        entry_X_list = []
-        entry_y_list = []
-        entry_w_list = []
-
+        n_new_signals = 0
         for sig in closed:
             incremental_trained_mints.add(sig["mint"])
-            mint = sig["mint"]
-            token_data = tokens.get(mint, {})
-            values = []
-            for f in FEATURES:
-                v = token_data.get(f, 0)
-                values.append(float(v) if v else 0.0)
+            snap = sig.get("feature_snapshot")
+            if snap:
+                values = snap
+            else:
+                token_data = tokens.get(sig["mint"], {})
+                values = [float(token_data.get(f, 0) or 0) for f in FEATURES]
 
             final_pnl = sig.get("close_pnl_pct", 0) or 0
             is_profitable = 1.0 if final_pnl >= 5.0 else 0.0
@@ -973,31 +974,30 @@ async def incremental_learner():
             else:
                 weight = 1.0
 
-            entry_X_list.append(values)
-            entry_y_list.append(is_profitable)
-            entry_w_list.append(weight)
+            pending_samples.append({"features": values, "label": is_profitable, "weight": weight})
+            n_new_signals += 1
 
+        n_new_missed = 0
         while resolved_missed:
             rm = resolved_missed.pop(0)
-            entry_X_list.append(rm["features"])
-            entry_y_list.append(rm["label"])
-            entry_w_list.append(rm["weight"])
+            pending_samples.append({"features": rm["features"], "label": rm["label"], "weight": rm["weight"]})
+            n_new_missed += 1
 
-        total = len(entry_X_list)
+        total = len(pending_samples)
         if total < 3:
-            log.info("INCREMENTAL: only %d samples (signals+missed), need >=3, skipping", total)
+            log.info("INCREMENTAL: %d pending samples (need >=3), skipping", total)
             continue
 
-        n_signals = len(closed)
-        n_missed = total - n_signals
-        log.info("INCREMENTAL: feeding %d samples (%d signals + %d missed) to model...", total, n_signals, n_missed)
+        n_signals = sum(1 for _ in pending_samples)
+        log.info("INCREMENTAL: feeding %d samples (%d new signals + %d new missed + %d carried over)...",
+                 total, n_new_signals, n_new_missed, total - n_new_signals - n_new_missed)
 
         if entry_model is None:
             continue
 
-        X = np.array(entry_X_list, dtype=np.float32)
-        y = np.array(entry_y_list, dtype=np.float32)
-        w = np.array(entry_w_list, dtype=np.float32)
+        X = np.array([s["features"] for s in pending_samples], dtype=np.float32)
+        y = np.array([s["label"] for s in pending_samples], dtype=np.float32)
+        w = np.array([s["weight"] for s in pending_samples], dtype=np.float32)
         X_n = (X - entry_mean) / entry_std
 
         X_t = torch.from_numpy(X_n)
@@ -1021,6 +1021,8 @@ async def incremental_learner():
             "INCREMENTAL: trained on %d samples (%d wins, %.0f%%) | loss=%.4f",
             total, wins, wins / total * 100, loss.item(),
         )
+
+        pending_samples.clear()
 
         entry_path = os.path.join(DATA_DIR, "entry_model.pt")
         torch.save({
