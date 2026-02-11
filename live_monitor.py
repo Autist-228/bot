@@ -39,16 +39,25 @@ logging.basicConfig(
 )
 log = logging.getLogger("live_monitor")
 
-FEATURES = [
-    "initial_buy_sol", "initial_price_usd", "initial_mcap_usd",
-    "v_sol_in_bonding", "v_tokens_in_bonding",
-    "total_buys", "total_sells", "total_buy_sol", "total_sell_sol",
-    "buy_sell_ratio", "sell_pressure", "unique_buyers", "unique_sellers",
-    "dex_liquidity_usd", "dex_volume_5m",
-    "dex_volume_1h", "dex_buys_5m", "dex_sells_5m", "dex_buys_1h", "dex_sells_1h",
-    "dex_market_cap", "dex_fdv",
-    "has_website", "has_socials", "migrated",
-]
+FEATURES = None
+
+def _load_features():
+    global FEATURES
+    meta_path = os.path.join(DATA_DIR, "model_meta.json")
+    if os.path.exists(meta_path):
+        import json as _json
+        with open(meta_path) as f:
+            meta = _json.load(f)
+        FEATURES = meta.get("features", [])
+        log.info("Loaded %d features from model_meta.json", len(FEATURES))
+    else:
+        FEATURES = [
+            "initial_buy_sol", "initial_price_usd", "initial_mcap_usd",
+            "v_sol_in_bonding", "v_tokens_in_bonding",
+            "total_buys", "total_sells", "total_buy_sol", "total_sell_sol",
+            "buy_sell_ratio", "sell_pressure", "unique_buyers", "unique_sellers",
+            "trade_count", "migrated",
+        ]
 
 MIN_BUYS_FOR_SIGNAL = 5
 MAX_BUYS_FOR_SIGNAL = 999
@@ -232,6 +241,7 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["sell_pressure"] = round(sells / max(1, buys + sells) * 100, 1)
             token["unique_buyers"] = len(tc.get("buyers", set()))
             token["unique_sellers"] = len(tc.get("sellers", set()))
+            token["trade_count"] = buys + sells
 
             label, confidence = predict_token(token)
             token["ml_checked"] = True
@@ -828,6 +838,7 @@ async def main():
     if not load_model():
         log.error("Cannot start without ML model. Run train_model.py first.")
         return
+    _load_features()
 
     if REAL_TRADING:
         init_trader()
