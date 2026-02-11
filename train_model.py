@@ -119,6 +119,7 @@ def extract_early_features(token):
 def load_and_prepare(data_dir=None):
     directory = data_dir or DATA_DIR
     hist_files = sorted(glob.glob(os.path.join(directory, "historical_progress_*.json")))
+    hist_files += sorted(glob.glob(os.path.join(directory, "historical_12h_*.json")))
     collect_files = sorted(glob.glob(os.path.join(directory, "collect_*.json")))
     jsonl_files = sorted(glob.glob(os.path.join(directory, "*.jsonl")))
     all_tokens = []
