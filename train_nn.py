@@ -30,7 +30,6 @@ ENTRY_FEATURES = [
     "buyer_rate",
     "sell_pressure",
     "momentum_15_30",
-    "migrated",
 ]
 
 EXIT_POSITION_FEATURES = [
@@ -132,6 +131,7 @@ def extract_entry_features(token, entry_ts):
     p_first = np.median(prices_first) if prices_first else 0
     p_second = np.median(prices_second) if prices_second else 0
     momentum = ((p_second / p_first) - 1) * 100 if p_first > 0 and p_second > 0 else 0.0
+    momentum = max(-500.0, min(500.0, momentum))
 
     age = max(1, entry_age)
     return {
@@ -142,7 +142,6 @@ def extract_entry_features(token, entry_ts):
         "buyer_rate": unique_buyers / age,
         "sell_pressure": n_sells / max(1, total) * 100,
         "momentum_15_30": momentum,
-        "migrated": int(token.get("migrated", 0)),
     }
 
 
@@ -166,7 +165,7 @@ def build_price_timeline(trades, entry_ts, entry_price, max_hold=MAX_HOLD_SEC):
 
 def simulate_trade_with_exits(timeline):
     if not timeline:
-        return -5.0, 0.0, "NO_DATA"
+        return None, 0.0, "NO_DATA"
 
     peak = 0.0
     for pt in timeline:
@@ -175,7 +174,7 @@ def simulate_trade_with_exits(timeline):
             peak = g
 
         if g <= -15:
-            return g, peak, "STOP_LOSS"
+            return max(g, -15.0), peak, "STOP_LOSS"
 
         if pt["elapsed"] >= 60 and g < 10:
             return g, peak, "TIME_STOP"
@@ -190,15 +189,13 @@ def simulate_trade_with_exits(timeline):
 
 
 def calculate_reward_weight(peak_gain, sim_pnl):
-    if peak_gain >= 100:
+    if sim_pnl >= 50:
         return 5.0
-    if peak_gain >= 50:
+    if sim_pnl >= 20:
         return 4.0
-    if peak_gain >= 20:
+    if sim_pnl >= 5:
         return 3.0
-    if sim_pnl < -10:
-        return 3.0
-    if peak_gain >= 5:
+    if sim_pnl <= -10:
         return 2.0
     return 1.0
 
@@ -300,6 +297,9 @@ def process_token(token):
 
     timeline = build_price_timeline(trades, entry_ts, entry_price)
     sim_pnl, peak_gain, exit_reason = simulate_trade_with_exits(timeline)
+
+    if sim_pnl is None:
+        return None
 
     is_profitable = 1.0 if sim_pnl >= PROFITABLE_THRESHOLD else 0.0
     reward_weight = calculate_reward_weight(peak_gain, sim_pnl)
@@ -435,6 +435,9 @@ def train_entry_model(X_train, y_train, w_train, epochs=100, lr=1e-3, batch_size
     dataset = TensorDataset(X_t, y_t, w_t)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+    pos_weight_val = neg / max(1, pos)
+    log.info("Using pos_weight=%.2f to balance classes", pos_weight_val)
+
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -446,7 +449,8 @@ def train_entry_model(X_train, y_train, w_train, epochs=100, lr=1e-3, batch_size
             optimizer.zero_grad()
             pred = model(X_b)
             bce = nn.functional.binary_cross_entropy(pred, y_b, reduction="none")
-            loss = (w_b * bce).mean()
+            class_w = torch.where(y_b > 0.5, pos_weight_val, 1.0)
+            loss = (w_b * class_w * bce).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()

@@ -246,7 +246,8 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["buyer_rate"] = len(tc.get("buyers", set())) / max(1, age)
             total_trades = buys + sells
             token["sell_pressure"] = round(sells / max(1, total_trades) * 100, 1)
-            token["momentum_15_30"] = ((p30 / p15) - 1) * 100 if p15 > 0 and p30 > 0 else 0.0
+            raw_mom = ((p30 / p15) - 1) * 100 if p15 > 0 and p30 > 0 else 0.0
+            token["momentum_15_30"] = max(-500.0, min(500.0, raw_mom))
             token["total_buys"] = buys
             token["total_sells"] = sells
             token["total_buy_sol"] = tc.get("buy_sol", 0)
@@ -262,14 +263,15 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["ml_label"] = label
             token["ml_confidence"] = confidence
 
-            if debug_count[0] < 5:
+            if confidence >= 25 or debug_count[0] < 10:
                 debug_count[0] += 1
                 log.info(
-                    "DEBUG ML %s: label=%s conf=%.0f%% age=%.0fs buys=%d buy_rate=%.2f vol_rate=%.3f buyer_rate=%.2f sell_p=%.0f%% mom=%.1f buy_sol=%.4f",
+                    "ML %s: label=%s conf=%.1f%% age=%.0fs buys=%d buy_rate=%.2f vol_rate=%.3f buyer_rate=%.2f sell_p=%.0f%% mom=%.1f buy_sol=%.4f mcap=%.0f",
                     token["symbol"], label, confidence, age, buys,
                     token.get("buy_rate", 0), token.get("volume_rate", 0),
                     token.get("buyer_rate", 0), token.get("sell_pressure", 0),
                     token.get("momentum_15_30", 0), token.get("initial_buy_sol", 0),
+                    token.get("initial_mcap_usd", 0),
                 )
 
             if label in ("ROCKET", "winner"):
@@ -868,15 +870,13 @@ async def incremental_learner():
             peak = sig.get("peak_gain", 0) or 0
             is_profitable = 1.0 if final_pnl >= 5.0 else 0.0
 
-            if peak >= 100:
+            if final_pnl >= 50:
                 weight = 5.0
-            elif peak >= 50:
+            elif final_pnl >= 20:
                 weight = 4.0
-            elif peak >= 20:
+            elif final_pnl >= 5:
                 weight = 3.0
-            elif final_pnl < -10:
-                weight = 3.0
-            elif peak >= 5:
+            elif final_pnl <= -10:
                 weight = 2.0
             else:
                 weight = 1.0
