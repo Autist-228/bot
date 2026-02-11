@@ -48,6 +48,58 @@ ENTRY_AGE_MAX = 120
 MAX_HOLD_SEC = 900
 SOL_PRICE_USD = 200.0
 
+SNAPSHOT_AGES = [15, 30, 60, 120, 300, 600, 900]
+
+
+def snapshots_to_trades(token):
+    snaps = token.get("snapshots", {})
+    if not snaps:
+        return []
+    created_ts = token.get("created_ts", 0)
+    if not created_ts:
+        return []
+    trades = []
+    prev_buys = 0
+    prev_sells = 0
+    prev_buy_sol = 0.0
+    for age in SNAPSHOT_AGES:
+        key = f"{age}s"
+        s = snaps.get(key)
+        if not s:
+            continue
+        price_sol = s.get("price_sol", 0)
+        if price_sol <= 0:
+            continue
+        ts = created_ts + age
+        cur_buys = s.get("buys", 0)
+        cur_sells = s.get("sells", 0)
+        cur_buy_sol = s.get("buy_sol", 0)
+        new_buys = max(0, cur_buys - prev_buys)
+        new_sells = max(0, cur_sells - prev_sells)
+        new_sol = max(0, cur_buy_sol - prev_buy_sol)
+        sol_per = new_sol / max(1, new_buys)
+        buyers = s.get("unique_buyers", 0)
+        for i in range(min(new_buys, 20)):
+            trades.append({"ts": ts, "type": "buy", "sol": round(sol_per, 6),
+                           "price_sol": price_sol, "trader": f"b{buyers}_{i}"})
+        for i in range(min(new_sells, 10)):
+            trades.append({"ts": ts, "type": "sell", "sol": 0.01,
+                           "price_sol": price_sol, "trader": f"s_{i}"})
+        prev_buys = cur_buys
+        prev_sells = cur_sells
+        prev_buy_sol = cur_buy_sol
+    return trades
+
+
+def ensure_trades(token):
+    if token.get("trades") and len(token["trades"]) >= 3:
+        return True
+    synth = snapshots_to_trades(token)
+    if len(synth) >= 3:
+        token["trades"] = synth
+        return True
+    return False
+
 
 def simulate_trade_from_trades(token):
     trades = token.get("trades", [])
@@ -227,11 +279,18 @@ def load_and_prepare(data_dir=None):
             seen_mints.add(mint)
             unique_tokens.append(t)
 
+    converted = 0
+    for t in unique_tokens:
+        if not (t.get("trades") and len(t["trades"]) >= 3):
+            if ensure_trades(t):
+                converted += 1
+
     with_trades = [t for t in unique_tokens if t.get("trades") and len(t["trades"]) >= 3]
-    log.info("Unique tokens: %d | With trades (>=3): %d", len(unique_tokens), len(with_trades))
+    log.info("Unique tokens: %d | With trades (>=3): %d (converted from snapshots: %d)",
+             len(unique_tokens), len(with_trades), converted)
 
     if not with_trades:
-        log.error("No tokens with trades array! Run historical_collector.py --save-trades first.")
+        log.error("No tokens with trades or snapshots!")
         return pd.DataFrame()
 
     rows = []

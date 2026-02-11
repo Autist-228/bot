@@ -81,33 +81,45 @@ class RateLimiter:
         self.last_call = time.monotonic()
 
 
-async def rpc_call(client, method, params, limiter, rpc_url=None):
+async def rpc_call(client, method, params, limiter, rpc_url=None, pool=None):
     await limiter.acquire()
     url = rpc_url
     if not url and API_KEYS:
         url = f"https://mainnet.helius-rpc.com/?api-key={API_KEYS[0]}"
     if not url:
         raise ValueError("No API keys configured. Set HELIUS_API_KEYS env var.")
-    for attempt in range(3):
+    for attempt in range(10):
+        if attempt > 0 and pool:
+            url, limiter = pool.get_rpc(attempt)
+            await limiter.acquire()
         try:
             resp = await client.post(
                 url,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
                 timeout=30,
             )
+            if resp.status_code == 429:
+                wait_time = min(2 ** attempt, 10)
+                log.warning("RPC 429 on key ...%s, switching key & waiting %ds (attempt %d/10)",
+                           url.split("=")[-1][-8:], wait_time, attempt + 1)
+                await asyncio.sleep(wait_time)
+                continue
             data = resp.json()
             if "error" in data:
                 err = data["error"]
                 if "429" in str(err) or "rate" in str(err).lower():
-                    await asyncio.sleep(2 ** attempt)
+                    wait_time = min(2 ** attempt, 10)
+                    log.warning("RPC error 429, switching key & waiting %ds (attempt %d/10)", wait_time, attempt + 1)
+                    await asyncio.sleep(wait_time)
                     continue
                 raise Exception(f"RPC error: {err}")
             return data.get("result")
         except httpx.TimeoutException:
-            if attempt < 2:
-                await asyncio.sleep(1)
+            if attempt < 9:
+                await asyncio.sleep(2)
                 continue
             raise
+    log.error("RPC call failed after 10 retries for %s", method)
     return None
 
 
@@ -126,21 +138,24 @@ async def fetch_sol_price(client):
     log.info("SOL price: $%.2f", SOL_PRICE_USD)
 
 
-async def get_signatures(client, limiter, before=None, limit=1000, rpc_url=None):
+async def get_signatures(client, limiter, before=None, limit=1000, rpc_url=None, pool=None):
     params = [PUMPFUN_PROGRAM, {"limit": limit, "commitment": "confirmed"}]
     if before:
         params[1]["before"] = before
-    return await rpc_call(client, "getSignaturesForAddress", params, limiter, rpc_url)
+    return await rpc_call(client, "getSignaturesForAddress", params, limiter, rpc_url, pool=pool)
 
 
-async def parse_enhanced(client, limiter, signatures, enhanced_url=None):
+async def parse_enhanced(client, limiter, signatures, enhanced_url=None, pool=None):
     await limiter.acquire()
     url = enhanced_url
     if not url and API_KEYS:
         url = f"https://api-mainnet.helius-rpc.com/v0/transactions/?api-key={API_KEYS[0]}"
     if not url:
         raise ValueError("No API keys configured. Set HELIUS_API_KEYS env var.")
-    for attempt in range(3):
+    for attempt in range(6):
+        if attempt > 0 and pool:
+            _key, limiter, _rpc, url = pool.next()
+            await limiter.acquire()
         try:
             resp = await client.post(
                 url,
@@ -148,14 +163,15 @@ async def parse_enhanced(client, limiter, signatures, enhanced_url=None):
                 timeout=30,
             )
             if resp.status_code == 429:
-                await asyncio.sleep(2 ** attempt)
+                wait_time = min(2 ** attempt, 8)
+                await asyncio.sleep(wait_time)
                 continue
             if resp.status_code != 200:
                 log.warning("Enhanced API %d: %s", resp.status_code, resp.text[:200])
                 return []
             return resp.json()
         except httpx.TimeoutException:
-            if attempt < 2:
+            if attempt < 5:
                 await asyncio.sleep(1)
                 continue
             return []
@@ -458,7 +474,7 @@ async def main():
         async with sem:
             _key, limiter, _rpc, enhanced = pool.next()
             try:
-                parsed = await parse_enhanced(client, limiter, sigs_batch, enhanced)
+                parsed = await parse_enhanced(client, limiter, sigs_batch, enhanced, pool=pool)
                 if parsed:
                     extract_events(parsed, tokens_data)
             except Exception as e:
@@ -467,26 +483,37 @@ async def main():
     async with httpx.AsyncClient() as client:
         await fetch_sol_price(client)
 
-        sig_rpc, sig_limiter = pool.get_rpc(0)
-        log.info("Phase 1: Scanning PumpFun program signatures (5 keys parallel)...")
+        sig_key_idx = 0
+        log.info("Phase 1: Scanning PumpFun program signatures (5 keys parallel, rotating sig key)...")
         cursor = None
         total_sigs = 0
         batch_num = 0
         reached_cutoff = False
         phase1_start = time.time()
+        empty_retries = 0
 
         while not reached_cutoff:
             batch_num += 1
 
+            sig_rpc, sig_limiter = pool.get_rpc(sig_key_idx % len(API_KEYS))
+            sig_key_idx += 1
+
             try:
-                sigs = await get_signatures(client, sig_limiter, before=cursor, rpc_url=sig_rpc)
+                sigs = await get_signatures(client, sig_limiter, before=cursor, rpc_url=sig_rpc, pool=pool)
             except Exception as e:
-                log.error("Sig fetch error: %s", e)
-                await asyncio.sleep(2)
+                log.error("Sig fetch error: %s, retrying with next key...", e)
+                await asyncio.sleep(3)
                 continue
 
             if not sigs:
-                break
+                empty_retries += 1
+                if empty_retries >= 5:
+                    log.info("No more signatures after 5 retries, stopping.")
+                    break
+                log.warning("Empty sigs response, retry %d/5 with next key...", empty_retries)
+                await asyncio.sleep(3)
+                continue
+            empty_retries = 0
 
             total_sigs += len(sigs)
             cursor = sigs[-1]["signature"]
