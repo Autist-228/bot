@@ -249,7 +249,7 @@ def extract_events(parsed_txs, tokens_data):
             td["sellers"].add(fee_payer)
 
 
-def reconstruct_token(mint, td):
+def reconstruct_token(mint, td, save_trades=False):
     trades = sorted(td["trades"], key=lambda t: t["ts"])
     if not trades:
         return None
@@ -382,6 +382,12 @@ def reconstruct_token(mint, td):
         "outcome": outcome,
         "trade_count": len(trades),
         "data_source": "historical_helius",
+        **({
+            "trades": [
+                {"ts": t["ts"], "type": t["type"], "sol": round(t["sol"], 6), "trader": t["trader"], "price_sol": t["price_sol"]}
+                for t in trades
+            ]
+        } if save_trades else {}),
     }
 
 
@@ -431,6 +437,7 @@ async def main():
     parser.add_argument("--estimate", action="store_true")
     parser.add_argument("--enrich", action="store_true", help="Enrich with DexScreener")
     parser.add_argument("--save-interval", type=int, default=0, help="Save progress every N batches")
+    parser.add_argument("--save-trades", action="store_true", help="Include raw trades array in output")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -544,7 +551,7 @@ async def main():
         outcomes = defaultdict(int)
 
         for mint, td in tokens_data.items():
-            token = reconstruct_token(mint, td)
+            token = reconstruct_token(mint, td, save_trades=args.save_trades)
             if token:
                 final_tokens.append(token)
                 outcomes[token["outcome"]] += 1
