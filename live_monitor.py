@@ -916,6 +916,15 @@ async def incremental_learner():
             total, wins, wins / total * 100, loss.item(),
         )
 
+        entry_path = os.path.join(DATA_DIR, "entry_model.pt")
+        torch.save({
+            "model": entry_model.state_dict(),
+            "n_features": len(FEATURES),
+            "mean": entry_mean.tolist(),
+            "std": entry_std.tolist(),
+        }, entry_path)
+        log.info("INCREMENTAL: model saved to %s", entry_path)
+
 
 async def main():
     duration = int(os.getenv("MONITOR_DURATION", "1800"))
