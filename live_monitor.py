@@ -125,8 +125,12 @@ def predict_token(token_data: dict) -> tuple[str, float]:
     X_scaled = scaler.transform(X)
     pred = model.predict(X_scaled)[0]
     proba = model.predict_proba(X_scaled)[0]
-    label = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}.get(pred, "unknown")
-    confidence = max(proba) * 100
+    if len(proba) == 2:
+        label = "ROCKET" if pred == 1 else "trash"
+        confidence = proba[1] * 100
+    else:
+        label = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}.get(pred, "unknown")
+        confidence = max(proba) * 100
     return label, confidence
 
 
@@ -214,6 +218,7 @@ def calc_bonding_curve_pnl(sig: dict, token_data: dict) -> float | None:
 
 
 async def ml_scanner(client: httpx.AsyncClient):
+    debug_count = [0]
     while True:
         await asyncio.sleep(5)
         now = time.time()
@@ -238,12 +243,14 @@ async def ml_scanner(client: httpx.AsyncClient):
             cur_price = bonding_curve_price_usd(v_sol, v_tokens)
             p15 = token.get("price_snap_15s", 0)
             p30 = token.get("price_snap_30s", 0)
-            token["entry_price_usd"] = cur_price
+            token["log_buy_sol"] = np.log1p(token.get("initial_buy_sol", 0))
+            token["log_mcap"] = np.log1p(token.get("initial_mcap_usd", 0))
+            token["buy_rate"] = buys / max(1, age)
+            token["volume_rate"] = tc.get("buy_sol", 0) / max(1, age)
+            token["buyer_rate"] = len(tc.get("buyers", set())) / max(1, age)
+            total_trades = buys + sells
+            token["sell_pressure"] = round(sells / max(1, total_trades) * 100, 1)
             token["momentum_15_30"] = ((p30 / p15) - 1) * 100 if p15 > 0 and p30 > 0 else 0.0
-            token["momentum_30_60"] = ((cur_price / p30) - 1) * 100 if p30 > 0 and cur_price > 0 else 0.0
-            prices = [p for p in [p15, p30, cur_price] if p > 0]
-            token["price_range_ratio"] = max(prices) / min(prices) if len(prices) >= 2 else 1.0
-            token["has_early_activity"] = 1 if len(set(prices)) > 1 else 0
             token["total_buys"] = buys
             token["total_sells"] = sells
             token["total_buy_sol"] = tc.get("buy_sol", 0)
@@ -258,6 +265,16 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["ml_checked"] = True
             token["ml_label"] = label
             token["ml_confidence"] = confidence
+
+            if debug_count[0] < 5:
+                debug_count[0] += 1
+                log.info(
+                    "DEBUG ML %s: label=%s conf=%.0f%% age=%.0fs buys=%d buy_rate=%.2f vol_rate=%.3f buyer_rate=%.2f sell_p=%.0f%% mom=%.1f buy_sol=%.4f",
+                    token["symbol"], label, confidence, age, buys,
+                    token.get("buy_rate", 0), token.get("volume_rate", 0),
+                    token.get("buyer_rate", 0), token.get("sell_pressure", 0),
+                    token.get("momentum_15_30", 0), token.get("initial_buy_sol", 0),
+                )
 
             if label in ("ROCKET", "winner"):
                 if ROCKET_ONLY and label != "ROCKET":

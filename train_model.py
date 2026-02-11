@@ -29,17 +29,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("trainer")
 
 FEATURES = [
-    "initial_buy_sol",
-    "initial_mcap_usd",
-    "entry_price_usd",
-    "v_sol_in_bonding",
-    "v_tokens_in_bonding",
+    "log_buy_sol",
+    "log_mcap",
+    "buy_rate",
+    "volume_rate",
+    "buyer_rate",
+    "sell_pressure",
     "momentum_15_30",
-    "momentum_30_60",
-    "price_range_ratio",
-    "has_early_activity",
     "migrated",
 ]
+
+BINARY_MODE = True
 
 LABEL_MAP = {"ROCKET": 3, "winner": 2, "good": 1, "trash": 0}
 
@@ -97,25 +97,21 @@ def extract_early_features(token):
     snapshots = token.get("snapshots", {})
     p15 = snapshots.get("15s", {}).get("price_usd", 0)
     p30 = snapshots.get("30s", {}).get("price_usd", 0)
-    p60 = snapshots.get("60s", {}).get("price_usd", 0)
     mom_15_30 = ((p30 / p15) - 1) * 100 if p15 > 0 and p30 > 0 else 0.0
-    mom_30_60 = ((p60 / p30) - 1) * 100 if p30 > 0 and p60 > 0 else 0.0
-    prices = [p for p in [p15, p30, p60] if p > 0]
-    if len(prices) >= 2:
-        price_range_ratio = max(prices) / min(prices)
-    else:
-        price_range_ratio = 1.0
-    has_activity = 1 if len(set(prices)) > 1 else 0
+    snap_30 = snapshots.get("30s", {})
+    buys_30 = snap_30.get("buys", 0)
+    unique_buyers_30 = snap_30.get("unique_buyers", 0)
+    buy_vol_30 = snap_30.get("buy_sol", 0)
+    sells_30 = snap_30.get("sells", 0)
+    total_trades = buys_30 + sells_30
     return {
-        "initial_buy_sol": token.get("initial_buy_sol", 0),
-        "initial_mcap_usd": token.get("initial_mcap_usd", 0),
-        "entry_price_usd": p60,
-        "v_sol_in_bonding": token.get("v_sol_in_bonding", 0),
-        "v_tokens_in_bonding": token.get("v_tokens_in_bonding", 0),
+        "log_buy_sol": np.log1p(token.get("initial_buy_sol", 0)),
+        "log_mcap": np.log1p(token.get("initial_mcap_usd", 0)),
+        "buy_rate": buys_30 / 30.0,
+        "volume_rate": buy_vol_30 / 30.0,
+        "buyer_rate": unique_buyers_30 / 30.0,
+        "sell_pressure": sells_30 / max(1, total_trades) * 100,
         "momentum_15_30": mom_15_30,
-        "momentum_30_60": mom_30_60,
-        "price_range_ratio": price_range_ratio,
-        "has_early_activity": has_activity,
         "migrated": int(token.get("migrated", 0)),
     }
 
@@ -126,12 +122,6 @@ def load_and_prepare(data_dir=None):
     collect_files = sorted(glob.glob(os.path.join(directory, "collect_*.json")))
     jsonl_files = sorted(glob.glob(os.path.join(directory, "*.jsonl")))
     all_tokens = []
-    for fp in hist_files:
-        with open(fp) as f:
-            data = json.load(f)
-        tokens = data.get("tokens", [])
-        log.info("Loaded %d tokens from %s", len(tokens), os.path.basename(fp))
-        all_tokens.extend(tokens)
     for fp in collect_files:
         with open(fp) as f:
             data = json.load(f)
@@ -148,6 +138,12 @@ def load_and_prepare(data_dir=None):
                 tokens = data.get("tokens", [])
                 log.info("Loaded %d tokens from %s", len(tokens), os.path.basename(fp))
                 all_tokens.extend(tokens)
+    for fp in hist_files:
+        with open(fp) as f:
+            data = json.load(f)
+        tokens = data.get("tokens", [])
+        log.info("Loaded %d tokens from %s", len(tokens), os.path.basename(fp))
+        all_tokens.extend(tokens)
     log.info("Total raw tokens loaded: %d", len(all_tokens))
     seen_mints = set()
     unique_tokens = []
@@ -170,6 +166,10 @@ def load_and_prepare(data_dir=None):
         if entry_price <= 0:
             sim_stats["no_entry"] += 1
             continue
+        snap_30 = snapshots.get("30s", {})
+        if "buys" not in snap_30:
+            sim_stats["no_entry"] += 1
+            continue
         sim_stats["total"] += 1
         pnl, reason = simulate_trade(token)
         sim_stats["simulated"] += 1
@@ -188,7 +188,10 @@ def load_and_prepare(data_dir=None):
     log.info("Exit reasons: %s", exit_reasons)
     log.info("P&L labels: %s", pnl_labels)
     df = pd.DataFrame(rows)
-    df["label"] = df["outcome"].map(LABEL_MAP)
+    if BINARY_MODE:
+        df["label"] = (df["sim_pnl"] > 0).astype(int)
+    else:
+        df["label"] = df["outcome"].map(LABEL_MAP)
     for col in FEATURES:
         if col not in df.columns:
             df[col] = 0
@@ -206,9 +209,9 @@ def analyze_patterns(df):
     trash = df[df["outcome"] == "trash"]
     log.info("\n--- ROCKET vs TRASH feature comparison ---")
     compare_cols = [
-        "initial_buy_sol", "initial_mcap_usd", "entry_price_usd",
-        "momentum_15_30", "momentum_30_60", "price_range_ratio",
-        "has_early_activity", "migrated",
+        "log_buy_sol", "log_mcap", "buy_rate", "volume_rate",
+        "buyer_rate", "sell_pressure",
+        "momentum_15_30", "migrated",
     ]
     for col in compare_cols:
         r_med = rockets[col].median() if len(rockets) > 0 else 0
@@ -268,8 +271,11 @@ def train(df, model_type="rf"):
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
     labels = sorted(np.unique(y))
-    label_names = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}
-    target_names = [label_names.get(l, f"class_{l}") for l in labels]
+    if BINARY_MODE:
+        target_names = ["unprofitable", "profitable"]
+    else:
+        label_names = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}
+        target_names = [label_names.get(l, f"class_{l}") for l in labels]
     log.info("\nClassification Report:\n%s",
              classification_report(y_test, y_pred, target_names=target_names, zero_division=0))
     log.info("Confusion Matrix:\n%s", confusion_matrix(y_test, y_pred))
@@ -290,7 +296,8 @@ def train(df, model_type="rf"):
         "n_samples": len(X),
         "n_features": len(available_features),
         "features": available_features,
-        "label_map": {v: k for k, v in LABEL_MAP.items()},
+        "binary_mode": BINARY_MODE,
+        "label_map": {"0": "unprofitable", "1": "profitable"} if BINARY_MODE else {v: k for k, v in LABEL_MAP.items()},
         "sim_config": {
             "entry_snapshot": ENTRY_SNAPSHOT,
             "cost_roundtrip": round(COST_ROUNDTRIP, 4),
@@ -323,24 +330,40 @@ def backtest(df, model, scaler, features):
     y_true = test_df["label"].values
     y_pred = model.predict(X_scaled)
     labels = sorted(np.unique(y_true))
-    label_names = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}
-    target_names = [label_names.get(l, f"class_{l}") for l in labels]
+    if BINARY_MODE:
+        target_names = ["unprofitable", "profitable"]
+    else:
+        label_names = {0: "trash", 1: "good", 2: "winner", 3: "ROCKET"}
+        target_names = [label_names.get(l, f"class_{l}") for l in labels]
     log.info("\nBacktest Classification Report:\n%s",
              classification_report(y_true, y_pred, target_names=target_names, zero_division=0))
     actual_pnls = test_df["sim_pnl"].values
-    for pred_label, pred_name in [(3, "ROCKET"), (2, "winner")]:
-        mask = y_pred >= pred_label if pred_label == 2 else y_pred == pred_label
+    if BINARY_MODE:
+        mask = y_pred == 1
         if mask.sum() > 0:
             pnls = actual_pnls[mask]
             wins = (pnls > 0).sum()
             total = len(pnls)
             avg_pnl = pnls.mean()
             total_pnl_usd = sum(BET_SIZE_USD * p / 100 for p in pnls)
-            name = pred_name if pred_label == 3 else "ROCKET+winner"
             log.info(
-                "%s signals: %d | Win rate: %.1f%% (%d/%d) | Avg P&L: %+.1f%% | Total: $%+.2f",
-                name, total, wins / total * 100, wins, total, avg_pnl, total_pnl_usd,
+                "BUY signals: %d | Win rate: %.1f%% (%d/%d) | Avg P&L: %+.1f%% | Total: $%+.2f",
+                total, wins / total * 100, wins, total, avg_pnl, total_pnl_usd,
             )
+    else:
+        for pred_label, pred_name in [(3, "ROCKET"), (2, "winner")]:
+            mask = y_pred >= pred_label if pred_label == 2 else y_pred == pred_label
+            if mask.sum() > 0:
+                pnls = actual_pnls[mask]
+                wins = (pnls > 0).sum()
+                total = len(pnls)
+                avg_pnl = pnls.mean()
+                total_pnl_usd = sum(BET_SIZE_USD * p / 100 for p in pnls)
+                name = pred_name if pred_label == 3 else "ROCKET+winner"
+                log.info(
+                    "%s signals: %d | Win rate: %.1f%% (%d/%d) | Avg P&L: %+.1f%% | Total: $%+.2f",
+                    name, total, wins / total * 100, wins, total, avg_pnl, total_pnl_usd,
+                )
 
 
 def main():

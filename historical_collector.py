@@ -285,10 +285,33 @@ def reconstruct_token(mint, td):
             elif t["ts"] > target_ts:
                 break
         snap_price = nearest["price_sol"] if nearest else initial_price_sol
+        snap_buys = 0
+        snap_sells = 0
+        snap_buy_sol = 0.0
+        snap_sell_sol = 0.0
+        snap_buyers = set()
+        snap_sellers = set()
+        for t in trades:
+            if t["ts"] > target_ts:
+                break
+            if t["type"] == "buy":
+                snap_buys += 1
+                snap_buy_sol += t["sol"]
+                snap_buyers.add(t["trader"])
+            else:
+                snap_sells += 1
+                snap_sell_sol += t["sol"]
+                snap_sellers.add(t["trader"])
         snapshots[f"{interval}s"] = {
             "price_sol": snap_price,
             "price_usd": snap_price * SOL_PRICE_USD,
             "age_sec": interval,
+            "buys": snap_buys,
+            "sells": snap_sells,
+            "buy_sol": round(snap_buy_sol, 4),
+            "sell_sol": round(snap_sell_sol, 4),
+            "unique_buyers": len(snap_buyers),
+            "unique_sellers": len(snap_sellers),
         }
 
     last_priced = priced_trades[-1]

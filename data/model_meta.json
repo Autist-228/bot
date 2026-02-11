@@ -1,25 +1,22 @@
 {
-  "trained_at": "2026-02-11T01:56:21.096699+00:00",
+  "trained_at": "2026-02-11T02:37:22.884438+00:00",
   "model_type": "rf",
-  "n_samples": 30241,
-  "n_features": 10,
+  "n_samples": 3616,
+  "n_features": 8,
   "features": [
-    "initial_buy_sol",
-    "initial_mcap_usd",
-    "entry_price_usd",
-    "v_sol_in_bonding",
-    "v_tokens_in_bonding",
+    "log_buy_sol",
+    "log_mcap",
+    "buy_rate",
+    "volume_rate",
+    "buyer_rate",
+    "sell_pressure",
     "momentum_15_30",
-    "momentum_30_60",
-    "price_range_ratio",
-    "has_early_activity",
     "migrated"
   ],
+  "binary_mode": true,
   "label_map": {
-    "3": "ROCKET",
-    "2": "winner",
-    "1": "good",
-    "0": "trash"
+    "0": "unprofitable",
+    "1": "profitable"
   },
   "sim_config": {
     "entry_snapshot": "60s",
