@@ -170,12 +170,28 @@ class SniperTelegramBot:
             "\U0001f916 <b>СТАТУС БОТА: РАБОТАЕТ</b>",
             f"\u23f1 Аптайм: {self._format_uptime()}",
             "",
-            "\u2501\u2501\u2501 <b>\U0001f4e6 ПАКЕТЫ</b> \u2501\u2501\u2501",
-            f"\U0001f37d Пакетов съедено: {batches_eaten}",
-            f"\U0001f4ca Токенов скормлено: {tokens_fed:,}",
-            f"\U0001f4c1 Модель: {model_size} KB | Loss: {loss:.4f}" if loss > 0 else f"\U0001f4c1 Модель: {model_size} KB | Loss: ---",
-            f"\U0001f3af Accuracy: {last_acc:.1f}%" if last_acc > 0 else "",
-            f"\U0001f9e0 Циклов: {cycles} | Данных: {total_samples:,}",
+            "\u2501\u2501\u2501 <b>\U0001f9e0 НС1 (ВХОД)</b> \u2501\u2501\u2501",
+            f"\U0001f504 Циклов: {cycles} | Съедено: {total_samples:,}",
+            f"\U0001f4c9 Loss: {loss:.4f} | Acc: {last_acc:.1f}%" if loss > 0 else "\U0001f4c9 Loss: --- | Acc: ---",
+            "",
+        ]
+
+        exit_info = self.state.get("exit_model_info", {})
+        ex_cycles = exit_info.get("cycles", 0)
+        ex_loss = exit_info.get("loss", 0)
+        ex_samples = exit_info.get("total_samples", 0)
+        ex_sigs = exit_info.get("total_signals_used", 0)
+
+        lines += [
+            "\u2501\u2501\u2501 <b>\U0001f9e0 НС2 (ВЫХОД)</b> \u2501\u2501\u2501",
+        ]
+        if ex_cycles > 0:
+            lines.append(f"\U0001f504 Циклов: {ex_cycles} | Съедено: {ex_samples:,} из {ex_sigs} сиг")
+            lines.append(f"\U0001f4c9 Loss: {ex_loss:.4f}")
+        else:
+            lines.append("\u23f3 Ожидание данных...")
+
+        lines += [
             "",
             f"\u23f3 <b>Сбор #{cur_id}:</b> {cur_count} токенов ({batch_mins}:{batch_secs:02d} / 30:00, {batch_pct}%)",
         ]
@@ -217,12 +233,15 @@ class SniperTelegramBot:
 
         period_name = PERIODS[self.current_period][1]
         row2 = [
-            InlineKeyboardButton("\U0001f4e6 Пакеты", callback_data="batch_history"),
-            InlineKeyboardButton("\U0001f4ca Часовой лог", callback_data="hourly_log"),
+            InlineKeyboardButton("\U0001f4e6 НС1 пакеты", callback_data="batch_history"),
+            InlineKeyboardButton("\U0001f4e6 НС2 пакеты", callback_data="exit_batch_history"),
         ]
         row3 = [
+            InlineKeyboardButton("\U0001f4ca Часовой лог", callback_data="hourly_log"),
+            InlineKeyboardButton("\U0001f9e0 Модели", callback_data="model"),
+        ]
+        row3b = [
             InlineKeyboardButton("\U0001f4cb Токены", callback_data="tokens_0"),
-            InlineKeyboardButton("\U0001f9e0 Модель", callback_data="model"),
         ]
         row4 = [
             InlineKeyboardButton(f"\u23f0 {period_name}", callback_data="period"),
@@ -231,7 +250,7 @@ class SniperTelegramBot:
             row4.append(InlineKeyboardButton(f"\u26a0\ufe0f ({err_count})", callback_data="errors"))
         row4.append(InlineKeyboardButton("\U0001f504 Обновить", callback_data="refresh"))
 
-        rows = [row1, row2, row3, row4]
+        rows = [row1, row2, row3, row3b, row4]
         if self.session_active:
             rows.insert(1, [InlineKeyboardButton("\U0001f4ca Сессия", callback_data="session_view")])
 
@@ -428,7 +447,7 @@ class SniperTelegramBot:
         tokens_fed = bs.get("total_tokens_fed", 0)
 
         lines = [
-            "\U0001f4e6 <b>ИСТОРИЯ ПАКЕТОВ</b>",
+            "\U0001f4e6 <b>НС1 (ВХОД) — ИСТОРИЯ ПАКЕТОВ</b>",
             "",
             f"\U0001f37d Всего: {batches_eaten} пакетов, {tokens_fed:,} токенов",
             "",
@@ -454,6 +473,43 @@ class SniperTelegramBot:
         return "\n".join(lines)
 
     def _build_batch_history_keyboard(self):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f3e0 Главная", callback_data="home")],
+        ])
+
+    def _build_exit_batch_history_text(self):
+        bs = self._get_batch_state()
+        history = bs.get("history", [])
+        exit_info = self.state.get("exit_model_info", {})
+        ex_cycles = exit_info.get("cycles", 0)
+        ex_samples = exit_info.get("total_samples", 0)
+        ex_sigs = exit_info.get("total_signals_used", 0)
+
+        lines = [
+            "\U0001f4e6 <b>НС2 (ВЫХОД) — ИСТОРИЯ ПАКЕТОВ</b>",
+            "",
+            f"\U0001f504 Циклов: {ex_cycles}",
+            f"\U0001f4ca Съедено: {ex_samples:,} точек из {ex_sigs} сигналов",
+            "",
+        ]
+
+        has_exit = [h for h in history if h.get("exit_samples", 0) > 0]
+        if not has_exit:
+            lines.append("Данных по НС2 ещё нет.")
+        else:
+            for h in reversed(has_exit[-10:]):
+                bid = h.get("id", 0)
+                e_samp = h.get("exit_samples", 0)
+                e_sigs = h.get("exit_signals", 0)
+                e_loss = h.get("exit_loss", 0)
+                lines.append(
+                    f"#{bid} | {e_samp} точек из {e_sigs} сиг | "
+                    f"loss={e_loss:.4f}"
+                )
+
+        return "\n".join(lines)
+
+    def _build_exit_batch_history_keyboard(self):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("\U0001f3e0 Главная", callback_data="home")],
         ])
@@ -498,9 +554,12 @@ class SniperTelegramBot:
             pnl_val = snap.get("hour_pnl_usd", 0)
             loss_val = snap.get("model_loss", 0)
             acc = snap.get("model_accuracy", 0)
+            ex_loss = snap.get("exit_loss", 0)
+            ex_cyc = snap.get("exit_cycles", 0)
+            ex_line = f" | НС2: {ex_loss:.4f} ({ex_cyc}ц)" if ex_cyc > 0 else ""
             lines.append(
-                f"{t} | {sigs} sig {w}W/{lo}L ({wr:.0f}%) "
-                f"${pnl_val:+.2f} | loss={loss_val:.4f} acc={acc:.0f}%"
+                f"{t} | {sigs}sig {w}W/{lo}L "
+                f"${pnl_val:+.2f} | НС1: {loss_val:.4f}{ex_line}"
             )
 
         return "\n".join(lines)
@@ -647,6 +706,12 @@ class SniperTelegramBot:
             self._current_screen = "batch_history"
             text = self._build_batch_history_text()
             kb = self._build_batch_history_keyboard()
+            await self._send_or_edit(chat_id, text, kb, msg_id)
+
+        elif data == "exit_batch_history":
+            self._current_screen = "exit_batch_history"
+            text = self._build_exit_batch_history_text()
+            kb = self._build_exit_batch_history_keyboard()
             await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data == "hourly_log":
