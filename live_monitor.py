@@ -1070,6 +1070,8 @@ def generate_live_exit_samples(sig: dict) -> tuple[list, list]:
         return [], []
     entry_conf = sig.get("ml_confidence", 50.0) / 100.0
     entry_cost = sig.get("entry_cost_pct", 0)
+    entry_loss_norm = min(model_info["loss"] / 2.0, 1.0) if model_info["loss"] > 0 else 0.5
+    last_acc = batch_state["history"][-1]["accuracy"] / 100.0 if batch_state["history"] else 0.5
 
     all_gains = [pt["pnl"] - entry_cost for pt in timeline]
     overall_peak = max(all_gains)
@@ -1099,7 +1101,7 @@ def generate_live_exit_samples(sig: dict) -> tuple[list, list]:
             drop_from_peak / 100.0,
             float(np.clip(velocity, -1, 1)),
         ]
-        full_features = list(entry_features) + [entry_conf] + pos_features
+        full_features = list(entry_features) + [entry_conf, entry_loss_norm, last_acc] + pos_features
 
         future_gains = all_gains[i + 1:i + 20]
         if not future_gains:
@@ -1286,7 +1288,7 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
             exit_mean = eX.mean(axis=0)
             exit_std = eX.std(axis=0)
             exit_std[exit_std < 1e-6] = 1.0
-            log.info("EXIT MODEL created fresh: %d features (15 entry + 1 conf + 5 position)", n_exit_features)
+            log.info("EXIT MODEL created fresh: %d features (15 entry + 1 conf + 2 ns1_stats + 5 position)", n_exit_features)
 
         eX_n = (eX - exit_mean) / exit_std
         eX_t = torch.from_numpy(eX_n)
