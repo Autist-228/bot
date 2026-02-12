@@ -1,0 +1,37 @@
+Solana Sniper Bot V2
+====================
+
+1. pip install -r requirements.txt
+
+2. .env:
+   TELEGRAM_BOT_TOKEN=...
+   TELEGRAM_CHAT_ID=...
+   HELIUS_API_KEY=...
+   HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+   SOLANA_PRIVATE_KEY=...  (for real trading only)
+
+3. Paper trading (24/7):
+   python3 live_monitor.py --continuous
+
+4. Real trading:
+   REAL_TRADING=1 python3 live_monitor.py --continuous
+
+Files:
+  live_monitor.py    - main bot (scanning, signals, batch learning, exits)
+  telegram_bot.py    - Telegram UI (status, batch history, hourly log)
+  config.py          - all settings (bet size, stop-loss, confidence, etc.)
+  real_trader.py     - on-chain execution (Jupiter swap)
+  train_nn.py        - train model from historical data
+  train_model.py     - train sklearn model (alternative)
+  collector.py       - collect live token data
+  historical_collector.py - collect historical data from Helius
+  enrich_trades.py   - enrich collected data with trade details
+  data/entry_model.pt - trained neural network (ready to use)
+  data/exit_model.pt  - exit timing model
+
+Batch Learning System:
+  - Every 30 min: collects ALL tokens (not just rockets)
+  - Next 30 min: checks outcomes, feeds batch to model
+  - Model updates weights every ~60 min cycle
+  - Hourly stats saved to data/hourly_stats.json
+  - Model snapshots every 4 hours: data/entry_model_hN.pt

@@ -11,8 +11,7 @@ env/
 dist/
 build/
 .eggs/
-data/*.json
-data/*.pkl
-data/*.joblib
 logs/
-data/
+data/*
+!data/.gitkeep
+!data/*.pt
