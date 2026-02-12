@@ -182,7 +182,8 @@ def load_model():
                 exit_model_info[k] = v
             log.info("Exit NN loaded (%d features) | restored %d cycles, loss=%.4f", n_xf, exit_model_info["cycles"], exit_model_info["loss"])
         else:
-            log.info("Exit NN loaded (%d features)", n_xf)
+            exit_model_info["cycles"] = 1
+            log.info("Exit NN loaded (%d features) | pre-trained model", n_xf)
     return True
 
 
@@ -1123,11 +1124,12 @@ def _record_shadow_trade(sig: dict, close_pnl: float, rule_reason: str):
         trade = {
             "symbol": sig.get("symbol", "?"),
             "time": datetime.now(timezone.utc).isoformat(),
-            "ns2_pnl": None,
+            "ns2_pnl": round(close_pnl, 1),
             "rules_pnl": round(close_pnl, 1),
-            "ns2_usd": None,
+            "ns2_usd": round(rules_pnl_usd, 2),
             "rules_usd": round(rules_pnl_usd, 2),
             "rule": rule_reason,
+            "ns2_held": True,
         }
         shadow_stats["trades"].append(trade)
         if len(shadow_stats["trades"]) > 200:
