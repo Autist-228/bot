@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import random
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -521,8 +522,8 @@ def train_entry_model(X_train, y_train, w_train, epochs=100, lr=1e-3, batch_size
             n_batches += 1
         scheduler.step()
 
+        avg_loss = total_loss / max(1, n_batches)
         if (epoch + 1) % 25 == 0 or epoch == 0:
-            avg_loss = total_loss / max(1, n_batches)
             log.info(
                 "Epoch %d/%d | Loss: %.6f | LR: %.6f",
                 epoch + 1,
@@ -531,6 +532,7 @@ def train_entry_model(X_train, y_train, w_train, epochs=100, lr=1e-3, batch_size
                 scheduler.get_last_lr()[0],
             )
 
+    model._final_loss = avg_loss
     return model, optimizer
 
 
@@ -574,10 +576,11 @@ def train_exit_model(X_train, y_train, epochs=80, lr=1e-3, batch_size=512):
             n_batches += 1
         scheduler.step()
 
+        avg_loss = total_loss / max(1, n_batches)
         if (epoch + 1) % 25 == 0 or epoch == 0:
-            avg_loss = total_loss / max(1, n_batches)
             log.info("Epoch %d/%d | Loss: %.6f", epoch + 1, epochs, avg_loss)
 
+    model._final_loss = avg_loss
     return model, optimizer
 
 
@@ -670,6 +673,17 @@ def save_models(entry_model, exit_model, entry_opt, exit_opt, entry_mean, entry_
         "mean": entry_mean.tolist(),
         "std": entry_std.tolist(),
         "n_features": len(ENTRY_FEATURES),
+        "model_info": {
+            "cycles": 1,
+            "loss": getattr(entry_model, "_final_loss", 0),
+            "initial_loss": 0,
+            "total_samples": int(entry_mean.shape[0]) if hasattr(entry_mean, 'shape') else 0,
+            "total_wins": 0,
+            "rockets_found": 0, "rockets_missed": 0,
+            "last_train_ts": time.time(),
+            "last_save_time": datetime.now(timezone.utc).strftime("%H:%M"),
+            "file_size_kb": 0,
+        },
     }
     torch.save(entry_state, entry_path)
     log.info("Entry model saved: %s", entry_path)
@@ -681,6 +695,14 @@ def save_models(entry_model, exit_model, entry_opt, exit_opt, entry_mean, entry_
             "mean": exit_mean.tolist(),
             "std": exit_std.tolist(),
             "n_features": len(ENTRY_FEATURES) + 3 + len(EXIT_POSITION_FEATURES),
+            "exit_model_info": {
+                "cycles": 1,
+                "loss": getattr(exit_model, "_final_loss", 0),
+                "initial_loss": 0,
+                "total_samples": 0,
+                "total_signals_used": 0,
+                "last_train_ts": time.time(),
+            },
         }
         torch.save(exit_state, exit_path)
         log.info("Exit model saved: %s", exit_path)
