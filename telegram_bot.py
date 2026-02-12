@@ -233,7 +233,7 @@ class SniperTelegramBot:
         else:
             lines.append("\u2705 Ошибок нет")
 
-        return "\n".join([l for l in lines if l is not None and l != "None" and l != ""])
+        return "\n".join([l for l in lines if l is not None and l != "None"])
 
     def _build_main_keyboard(self):
         errors = self._get_errors()
