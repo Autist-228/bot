@@ -178,8 +178,7 @@ class SniperTelegramBot:
         if check_id > 0:
             check_pct = int(check_prog / max(1, check_total) * 100)
             lines.append(f"\U0001f50d Проверка #{check_id}: {check_prog}/{check_total} ({check_pct}%) | {check_samples} годных")
-        else:
-            lines.append(f"\u23f3 Сбор #{cur_id}: {cur_count} ток ({batch_mins}:{batch_secs:02d} / 30:00, {batch_pct}%)")
+        lines.append(f"\u23f3 Сбор #{cur_id}: {cur_count} ток ({batch_mins}:{batch_secs:02d} / 30:00, {batch_pct}%)")
 
         exit_info = self.state.get("exit_model_info", {})
         ex_cycles = exit_info.get("cycles", 0)
