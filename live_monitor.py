@@ -278,7 +278,6 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["volume_rate"] = tc.get("buy_sol", 0) / max(1, age)
             token["buyer_rate"] = len(tc.get("buyers", set())) / max(1, age)
             total_trades = buys + sells
-            token["sell_pressure"] = round(sells / max(1, total_trades) * 100, 1)
             raw_mom = ((p30 / p15) - 1) * 100 if p15 > 0 and p30 > 0 else 0.0
             token["momentum_15_30"] = max(-500.0, min(500.0, raw_mom))
             token["total_buys"] = buys
@@ -580,8 +579,8 @@ async def signal_price_updater():
                         unrealized = remaining * (current_pnl / 100.0)
                         total = sig["realized_pnl"] + unrealized
                         sig["pnl_usd"] = round(BET_SIZE_USD * total, 4)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Price update error for %s: %s", sig.get("symbol", "?"), exc)
 
 
 async def listen_pumpportal():
@@ -1001,6 +1000,7 @@ pending_samples: list[dict] = []
 
 async def incremental_learner():
     global entry_model, exit_model
+    telegram_state["learner_running"] = True
     while True:
         await asyncio.sleep(INCREMENTAL_INTERVAL)
         closed = [s for s in signals if s["status"] == "CLOSED" and s["mint"] not in incremental_trained_mints]
@@ -1047,7 +1047,6 @@ async def incremental_learner():
             log.info("INCREMENTAL: %d pending samples (need >=3), skipping", total)
             continue
 
-        n_signals = sum(1 for _ in pending_samples)
         log.info("INCREMENTAL: feeding %d samples (%d new signals + %d new missed + %d carried over)...",
                  total, n_new_signals, n_new_missed, total - n_new_signals - n_new_missed)
 
@@ -1089,7 +1088,6 @@ async def incremental_learner():
         model_info["total_samples"] += total
         model_info["total_wins"] += wins
         model_info["last_train_ts"] = time.time()
-        telegram_state["learner_running"] = True
 
         pending_samples.clear()
 
@@ -1212,8 +1210,6 @@ async def main():
                     )
             except asyncio.CancelledError:
                 log.info("Continuous mode interrupted, shutting down...")
-                if tg_bot:
-                    await tg_bot.stop()
         else:
             await asyncio.sleep(duration)
 

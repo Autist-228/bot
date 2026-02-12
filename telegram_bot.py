@@ -369,7 +369,7 @@ class SniperTelegramBot:
             "\u2264-10%: вес 2.0",
             "остальное: вес 1.0",
         ]
-        return "\n".join([l for l in lines if l is not None])
+        return "\n".join([l for l in lines if l is not None and l != ""])
 
     def _build_model_keyboard(self):
         return InlineKeyboardMarkup([
