@@ -1055,6 +1055,23 @@ def _sync_model_info_from_batches():
                  exit_model_info["cycles"], exit_model_info["loss"], exit_model_info["total_samples"])
 
 
+def _resave_model_if_needed():
+    entry_path = os.path.join(DATA_DIR, "entry_model.pt")
+    if not os.path.exists(entry_path) or entry_model is None:
+        return
+    state = torch.load(entry_path, map_location="cpu", weights_only=False)
+    if state.get("model_info"):
+        return
+    torch.save({
+        "model": entry_model.state_dict(),
+        "n_features": state["n_features"],
+        "mean": state["mean"],
+        "std": state["std"],
+        "model_info": dict(model_info),
+    }, entry_path)
+    log.info("Re-saved entry_model.pt with model_info (cycles=%d, loss=%.4f)", model_info["cycles"], model_info["loss"])
+
+
 def _update_model_file_info():
     entry_path = os.path.join(DATA_DIR, "entry_model.pt")
     if os.path.exists(entry_path):
@@ -1703,6 +1720,7 @@ async def main():
 
     _load_batch_state()
     _sync_model_info_from_batches()
+    _resave_model_if_needed()
 
     if REAL_TRADING:
         init_trader()
