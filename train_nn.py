@@ -262,7 +262,7 @@ def calculate_reward_weight(peak_gain, sim_pnl):
     return 1.0
 
 
-def generate_exit_samples(timeline, entry_features_vec):
+def generate_exit_samples(timeline, entry_features_vec, entry_conf=0.7, entry_loss_norm=0.5, last_acc=0.5):
     if len(timeline) < 3:
         return [], []
 
@@ -297,7 +297,7 @@ def generate_exit_samples(timeline, entry_features_vec):
             float(np.clip(velocity, -1, 1)),
         ]
 
-        full_features = list(entry_features_vec) + pos_features
+        full_features = list(entry_features_vec) + [entry_conf, entry_loss_norm, last_acc] + pos_features
 
         future_window = all_gains[i + 1 : i + 20]
         if not future_window:
@@ -380,6 +380,7 @@ def process_token(token):
         "created_ts": created_ts,
         "symbol": token.get("symbol", ""),
         "mint": token.get("mint", ""),
+        "entry_features_vec": features_vec,
     }
 
 
@@ -453,7 +454,7 @@ def build_samples(tokens):
     log.info("Peaks: %d@50%%+ | %d@20%%+ | %d@5%%+", stats["peak50"], stats["peak20"], stats["peak5"])
     log.info("Exit samples: %d", len(exit_X))
 
-    n_exit_features = len(ENTRY_FEATURES) + len(EXIT_POSITION_FEATURES)
+    n_exit_features = len(ENTRY_FEATURES) + 3 + len(EXIT_POSITION_FEATURES)
     return (
         np.array(entry_X, dtype=np.float32),
         np.array(entry_y, dtype=np.float32),
@@ -679,7 +680,7 @@ def save_models(entry_model, exit_model, entry_opt, exit_opt, entry_mean, entry_
             "optimizer": exit_opt.state_dict(),
             "mean": exit_mean.tolist(),
             "std": exit_std.tolist(),
-            "n_features": len(ENTRY_FEATURES) + len(EXIT_POSITION_FEATURES),
+            "n_features": len(ENTRY_FEATURES) + 3 + len(EXIT_POSITION_FEATURES),
         }
         torch.save(exit_state, exit_path)
         log.info("Exit model saved: %s", exit_path)
@@ -724,21 +725,61 @@ def main():
     train_tokens, test_tokens = prepare_datasets(tokens, train_ratio=args.train_ratio)
 
     log.info("Building training data from %d tokens...", len(train_tokens))
-    train_eX, train_ey, train_ew, train_xX, train_xy = build_samples(train_tokens)
+    processed_results = []
+    entry_X, entry_y, entry_w = [], [], []
+    for token in train_tokens:
+        result = process_token(token)
+        if result is None:
+            continue
+        processed_results.append(result)
+        entry_X.append(result["entry_features"])
+        entry_y.append(result["entry_label"])
+        entry_w.append(result["reward_weight"])
+
+    train_eX = np.array(entry_X, dtype=np.float32)
+    train_ey = np.array(entry_y, dtype=np.float32)
+    train_ew = np.array(entry_w, dtype=np.float32)
+    log.info("Entry samples: %d", len(train_eX))
 
     train_eX_n, _, entry_mean, entry_std = normalize_features(train_eX)
-
-    if len(train_xX) > 0:
-        train_xX_n, _, exit_mean, exit_std = normalize_features(train_xX)
-    else:
-        n_exit = len(ENTRY_FEATURES) + len(EXIT_POSITION_FEATURES)
-        exit_mean = np.zeros(n_exit, dtype=np.float32)
-        exit_std = np.ones(n_exit, dtype=np.float32)
-        train_xX_n = train_xX
 
     entry_model, entry_opt = train_entry_model(
         train_eX_n, train_ey, train_ew, epochs=args.epochs_entry, lr=args.lr
     )
+
+    log.info("=" * 60)
+    log.info("REBUILDING EXIT SAMPLES WITH REAL CONFIDENCE (23 features)")
+    log.info("=" * 60)
+    entry_model.eval()
+    with torch.no_grad():
+        all_confs = entry_model(torch.from_numpy(train_eX_n)).numpy()
+    avg_acc = float((train_ey == (all_confs >= 0.5).astype(float)).mean())
+    log.info("EntryNet avg accuracy on train: %.1f%%", avg_acc * 100)
+
+    exit_X2, exit_y2 = [], []
+    n_entry = len(ENTRY_FEATURES)
+    for i, result in enumerate(processed_results):
+        conf_val = float(all_confs[i])
+        for xf_row, xl_row in zip(result["exit_features"], result["exit_labels"]):
+            row = list(xf_row)
+            row[n_entry] = conf_val
+            row[n_entry + 1] = 0.5
+            row[n_entry + 2] = avg_acc
+            exit_X2.append(row)
+            exit_y2.append(xl_row)
+
+    log.info("Exit samples (23-feature): %d", len(exit_X2))
+    n_exit = len(ENTRY_FEATURES) + 3 + len(EXIT_POSITION_FEATURES)
+    train_xX = np.array(exit_X2, dtype=np.float32) if exit_X2 else np.zeros((0, n_exit), dtype=np.float32)
+    train_xy = np.array(exit_y2, dtype=np.float32) if exit_y2 else np.zeros(0, dtype=np.float32)
+
+    if len(train_xX) > 0:
+        train_xX_n, _, exit_mean, exit_std = normalize_features(train_xX)
+    else:
+        exit_mean = np.zeros(n_exit, dtype=np.float32)
+        exit_std = np.ones(n_exit, dtype=np.float32)
+        train_xX_n = train_xX
+
     exit_model, exit_opt = train_exit_model(train_xX_n, train_xy, epochs=args.epochs_exit, lr=args.lr)
 
     backtest(entry_model, test_tokens, entry_mean, entry_std)
