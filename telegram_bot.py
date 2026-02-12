@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import time
@@ -54,6 +55,9 @@ class SniperTelegramBot:
 
     def _get_model_info(self):
         return self.state.get("model_info", {})
+
+    def _get_batch_state(self):
+        return self.state.get("batch_state", {})
 
     def _format_uptime(self):
         start = self._get_stats().get("start", 0)
@@ -115,6 +119,7 @@ class SniperTelegramBot:
         stats = self._get_stats()
         model = self._get_model_info()
         errors = self._get_errors()
+        bs = self._get_batch_state()
         period_sigs = self._signals_for_period()
         period_name = PERIODS[self.current_period][1]
         pnl = self._calc_pnl(period_sigs)
@@ -129,23 +134,31 @@ class SniperTelegramBot:
 
         err_count = len([e for e in errors if time.time() - e.get("ts", 0) < 86400])
 
-        last_train_ago = ""
-        lt = model.get("last_train_ts", 0)
-        if lt > 0:
-            ago = int(time.time() - lt)
-            if ago < 60:
-                last_train_ago = f"{ago} сек назад"
-            else:
-                last_train_ago = f"{ago // 60} мин назад"
-        else:
-            last_train_ago = "ещё не было"
-
         model_size = model.get("file_size_kb", 0)
-        total_samples = model.get("total_samples", 0)
-        cycles = model.get("cycles", 0)
         loss = model.get("loss", 0)
-        rockets_found = model.get("rockets_found", 0)
-        rockets_missed = model.get("rockets_missed", 0)
+        cycles = model.get("cycles", 0)
+        total_samples = model.get("total_samples", 0)
+
+        batches_eaten = bs.get("total_batches", 0)
+        tokens_fed = bs.get("total_tokens_fed", 0)
+
+        cur_id = bs.get("current_id", 1)
+        cur_start = bs.get("current_start", 0)
+        cur_count = bs.get("current_count", 0)
+        batch_elapsed = int(time.time() - cur_start) if cur_start > 0 else 0
+        batch_mins = batch_elapsed // 60
+        batch_secs = batch_elapsed % 60
+        batch_pct = min(100, int(batch_elapsed / 1800 * 100)) if cur_start > 0 else 0
+
+        check_id = bs.get("checking_id", 0)
+        check_prog = bs.get("checking_progress", 0)
+        check_total = bs.get("checking_total", 0)
+        check_samples = bs.get("checking_samples", 0)
+
+        last_acc = 0.0
+        history = bs.get("history", [])
+        if history:
+            last_acc = history[-1].get("accuracy", 0)
 
         wr = 0
         if pnl["wins"] + pnl["losses"] > 0:
@@ -156,15 +169,24 @@ class SniperTelegramBot:
         lines = [
             "\U0001f916 <b>СТАТУС БОТА: РАБОТАЕТ</b>",
             f"\u23f1 Аптайм: {self._format_uptime()}",
-            f"\U0001f4ca Период: {period_name}",
             "",
-            "\u2501\u2501\u2501 <b>МОДЕЛЬ</b> \u2501\u2501\u2501",
-            f"\U0001f4c1 entry_model.pt ({model_size} KB)",
-            f"\U0001f9e0 Циклов обучения: {cycles}",
-            f"\U0001f4c9 Loss: {loss:.4f}" if loss > 0 else "\U0001f4c9 Loss: ---",
-            f"\U0001f37d Данных сожрано: {total_samples:,}",
-            f"\U0001f680 Ракет: {rockets_found} | Пропущено: {rockets_missed}",
-            f"\U0001f4c5 Посл. обучение: {last_train_ago}",
+            "\u2501\u2501\u2501 <b>\U0001f4e6 ПАКЕТЫ</b> \u2501\u2501\u2501",
+            f"\U0001f37d Пакетов съедено: {batches_eaten}",
+            f"\U0001f4ca Токенов скормлено: {tokens_fed:,}",
+            f"\U0001f4c1 Модель: {model_size} KB | Loss: {loss:.4f}" if loss > 0 else f"\U0001f4c1 Модель: {model_size} KB | Loss: ---",
+            f"\U0001f3af Accuracy: {last_acc:.1f}%" if last_acc > 0 else "",
+            f"\U0001f9e0 Циклов: {cycles} | Данных: {total_samples:,}",
+            "",
+            f"\u23f3 <b>Сбор #{cur_id}:</b> {cur_count} токенов ({batch_mins}:{batch_secs:02d} / 30:00, {batch_pct}%)",
+        ]
+
+        if check_id > 0:
+            check_pct = int(check_prog / max(1, check_total) * 100)
+            lines.append(f"\U0001f50d <b>Проверка #{check_id}:</b> {check_prog}/{check_total} ({check_pct}%) | {check_samples} годных")
+        elif batches_eaten > 0:
+            lines.append(f"\u2705 Последний пакет #{batches_eaten} скормлен")
+
+        lines += [
             "",
             f"\u2501\u2501\u2501 <b>МОНИТОР ({period_name})</b> \u2501\u2501\u2501",
             f"\U0001f4e1 Сигналов: {pnl['invested_count']}",
@@ -182,7 +204,7 @@ class SniperTelegramBot:
         else:
             lines.append("\u2705 Ошибок нет")
 
-        return "\n".join(lines)
+        return "\n".join([l for l in lines if l is not None and l != "None" and l != ""])
 
     def _build_main_keyboard(self):
         errors = self._get_errors()
@@ -195,17 +217,21 @@ class SniperTelegramBot:
 
         period_name = PERIODS[self.current_period][1]
         row2 = [
-            InlineKeyboardButton("\U0001f4cb Все токены", callback_data="tokens_0"),
-            InlineKeyboardButton("\U0001f9e0 Модель", callback_data="model"),
+            InlineKeyboardButton("\U0001f4e6 Пакеты", callback_data="batch_history"),
+            InlineKeyboardButton("\U0001f4ca Часовой лог", callback_data="hourly_log"),
         ]
         row3 = [
-            InlineKeyboardButton(f"\u23f0 Период: {period_name}", callback_data="period"),
+            InlineKeyboardButton("\U0001f4cb Токены", callback_data="tokens_0"),
+            InlineKeyboardButton("\U0001f9e0 Модель", callback_data="model"),
+        ]
+        row4 = [
+            InlineKeyboardButton(f"\u23f0 {period_name}", callback_data="period"),
         ]
         if err_count > 0:
-            row3.append(InlineKeyboardButton(f"\u26a0\ufe0f Ошибки ({err_count})", callback_data="errors"))
-        row3.append(InlineKeyboardButton("\U0001f504 Обновить", callback_data="refresh"))
+            row4.append(InlineKeyboardButton(f"\u26a0\ufe0f ({err_count})", callback_data="errors"))
+        row4.append(InlineKeyboardButton("\U0001f504 Обновить", callback_data="refresh"))
 
-        rows = [row1, row2, row3]
+        rows = [row1, row2, row3, row4]
         if self.session_active:
             rows.insert(1, [InlineKeyboardButton("\U0001f4ca Сессия", callback_data="session_view")])
 
@@ -329,6 +355,7 @@ class SniperTelegramBot:
 
     def _build_model_text(self):
         model = self._get_model_info()
+        bs = self._get_batch_state()
         model_size = model.get("file_size_kb", 0)
         last_save = model.get("last_save_time", "---")
         cycles = model.get("cycles", 0)
@@ -336,42 +363,135 @@ class SniperTelegramBot:
         initial_loss = model.get("initial_loss", 0)
         total_samples = model.get("total_samples", 0)
         total_wins = model.get("total_wins", 0)
-        rockets_missed = model.get("rockets_missed", 0)
-        avg_missed_pnl = model.get("avg_missed_pnl", 0)
+        rockets_found = model.get("rockets_missed", 0)
 
         win_pct = (total_wins / total_samples * 100) if total_samples > 0 else 0
+        loss_delta = ""
+        if initial_loss > 0 and loss > 0:
+            change = ((loss - initial_loss) / initial_loss) * 100
+            loss_delta = f" ({change:+.1f}%)"
+
+        history = bs.get("history", [])
+        last_acc = history[-1].get("accuracy", 0) if history else 0
+        avg_acc = 0.0
+        if history:
+            accs = [h.get("accuracy", 0) for h in history[-5:]]
+            avg_acc = sum(accs) / len(accs) if accs else 0
 
         lines = [
             "\U0001f9e0 <b>СТАТИСТИКА МОДЕЛИ</b>",
             "",
-            f"\U0001f4c1 Файл: entry_model.pt",
-            f"\U0001f4be Размер: {model_size} KB",
+            f"\U0001f4c1 entry_model.pt ({model_size} KB)",
             f"\U0001f4c5 Посл. сохранение: {last_save}",
             "",
             "\u2501\u2501\u2501 <b>ОБУЧЕНИЕ</b> \u2501\u2501\u2501",
-            f"\U0001f504 Циклов: {cycles}",
-            f"\U0001f4c9 Loss: {loss:.4f}" if loss > 0 else "\U0001f4c9 Loss: ---",
+            f"\U0001f504 Циклов (батчей): {cycles}",
+            f"\U0001f4c9 Loss: {loss:.4f}{loss_delta}" if loss > 0 else "\U0001f4c9 Loss: ---",
             f"\U0001f4c8 Начальный loss: {initial_loss:.4f}" if initial_loss > 0 else "",
-            f"\U0001f4ca Samples за всё время: {total_samples:,}",
-            f"\U0001f3c6 Из них побед: {total_wins:,} ({win_pct:.0f}%)",
+            f"\U0001f4ca Samples всего: {total_samples:,}",
+            f"\U0001f3c6 Побед: {total_wins:,} ({win_pct:.0f}%)",
             "",
-            "\u2501\u2501\u2501 <b>ПРОПУЩЕННЫЕ РАКЕТЫ</b> \u2501\u2501\u2501",
-            f"\U0001f680 Найдено за всё время: {rockets_missed}",
-            f"\U0001f4c8 Средний рост: +{avg_missed_pnl:.0f}%" if avg_missed_pnl > 0 else "",
-            "\U0001f37d Все скормлены в модель",
+            "\u2501\u2501\u2501 <b>КАЧЕСТВО</b> \u2501\u2501\u2501",
+            f"\U0001f3af Accuracy (посл.): {last_acc:.1f}%" if last_acc > 0 else "\U0001f3af Accuracy: ещё нет данных",
+            f"\U0001f4ca Accuracy (ср. 5): {avg_acc:.1f}%" if avg_acc > 0 else "",
+            f"\U0001f680 Реальных ракет найдено: {rockets_found}",
             "",
-            "\u2501\u2501\u2501 <b>ВОЗНАГРАЖДЕНИЯ</b> \u2501\u2501\u2501",
-            "\u2265200%: вес 10.0",
-            "\u2265100%: вес 7.0",
-            "\u226550%: вес 5.0",
-            "\u226520%: вес 3.0",
-            "\u22655%: вес 2.0",
-            "\u2264-10%: вес 2.0",
-            "остальное: вес 1.0",
+            "\u2501\u2501\u2501 <b>ВЕСА НАГРАД</b> \u2501\u2501\u2501",
+            "\u2265200%: 10 | \u2265100%: 7 | \u226550%: 5",
+            "\u226520%: 3 | \u22655%: 2 | \u2264-10%: 2",
         ]
         return "\n".join([l for l in lines if l is not None and l != ""])
 
     def _build_model_keyboard(self):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f3e0 Главная", callback_data="home")],
+        ])
+
+    def _build_batch_history_text(self):
+        bs = self._get_batch_state()
+        history = bs.get("history", [])
+        batches_eaten = bs.get("total_batches", 0)
+        tokens_fed = bs.get("total_tokens_fed", 0)
+
+        lines = [
+            "\U0001f4e6 <b>ИСТОРИЯ ПАКЕТОВ</b>",
+            "",
+            f"\U0001f37d Всего: {batches_eaten} пакетов, {tokens_fed:,} токенов",
+            "",
+        ]
+
+        if not history:
+            lines.append("Пакетов ещё нет. Первый будет через ~30 мин.")
+        else:
+            for h in reversed(history[-10:]):
+                bid = h.get("id", 0)
+                total = h.get("tokens_total", 0)
+                fed = h.get("tokens_fed", 0)
+                rockets = h.get("rockets", 0)
+                acc = h.get("accuracy", 0)
+                loss_val = h.get("loss", 0)
+                wp = h.get("win_pct", 0)
+                lines.append(
+                    f"#{bid} | {fed}/{total} ток | "
+                    f"{rockets} \U0001f680 | acc={acc:.0f}% | "
+                    f"loss={loss_val:.4f} | win={wp:.0f}%"
+                )
+
+        return "\n".join(lines)
+
+    def _build_batch_history_keyboard(self):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f3e0 Главная", callback_data="home")],
+        ])
+
+    def _build_hourly_text(self):
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        stats_file = os.path.join(data_dir, "hourly_stats.json")
+
+        lines = [
+            "\U0001f4ca <b>ЧАСОВОЙ ЛОГ</b>",
+            "",
+        ]
+
+        if not os.path.exists(stats_file):
+            lines.append("Данных ещё нет. Первый снимок через ~1 час.")
+            return "\n".join(lines)
+
+        try:
+            with open(stats_file) as f:
+                snapshots = json.load(f)
+        except Exception:
+            lines.append("Ошибка чтения файла.")
+            return "\n".join(lines)
+
+        if not snapshots:
+            lines.append("Снимков ещё нет.")
+            return "\n".join(lines)
+
+        lines.append(f"Всего снимков: {len(snapshots)}")
+        lines.append("")
+
+        for snap in reversed(snapshots[-12:]):
+            dt = snap.get("datetime", "")
+            try:
+                t = datetime.fromisoformat(dt).strftime("%d.%m %H:%M")
+            except Exception:
+                t = dt[:16]
+            sigs = snap.get("hour_signals", 0)
+            w = snap.get("hour_wins", 0)
+            lo = snap.get("hour_losses", 0)
+            wr = snap.get("hour_win_rate", 0)
+            pnl_val = snap.get("hour_pnl_usd", 0)
+            loss_val = snap.get("model_loss", 0)
+            acc = snap.get("model_accuracy", 0)
+            lines.append(
+                f"{t} | {sigs} sig {w}W/{lo}L ({wr:.0f}%) "
+                f"${pnl_val:+.2f} | loss={loss_val:.4f} acc={acc:.0f}%"
+            )
+
+        return "\n".join(lines)
+
+    def _build_hourly_keyboard(self):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("\U0001f3e0 Главная", callback_data="home")],
         ])
@@ -507,6 +627,18 @@ class SniperTelegramBot:
             self._current_screen = "model"
             text = self._build_model_text()
             kb = self._build_model_keyboard()
+            await self._send_or_edit(chat_id, text, kb, msg_id)
+
+        elif data == "batch_history":
+            self._current_screen = "batch_history"
+            text = self._build_batch_history_text()
+            kb = self._build_batch_history_keyboard()
+            await self._send_or_edit(chat_id, text, kb, msg_id)
+
+        elif data == "hourly_log":
+            self._current_screen = "hourly_log"
+            text = self._build_hourly_text()
+            kb = self._build_hourly_keyboard()
             await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data == "errors":

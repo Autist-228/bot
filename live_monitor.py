@@ -54,10 +54,22 @@ trade_counts: dict[str, dict] = {}
 signals: list[dict] = []
 stats = {"total": 0, "enriched": 0, "trades": 0, "signals": 0, "start": 0}
 
-missed_tokens: list[dict] = []
-missed_trained_mints: set[str] = set()
-MISSED_CHECK_DELAY = 900
-MISSED_PUMP_THRESHOLD = 50.0
+BATCH_DURATION = 1800
+current_batch_tokens: dict[str, dict] = {}
+pending_batches: list[dict] = []
+
+batch_state: dict = {
+    "current_id": 1,
+    "current_start": 0.0,
+    "current_count": 0,
+    "checking_id": 0,
+    "checking_progress": 0,
+    "checking_total": 0,
+    "checking_samples": 0,
+    "history": [],
+    "total_tokens_fed": 0,
+    "total_batches": 0,
+}
 
 SOL_PRICE_USD = 200.0
 entry_model = None
@@ -72,7 +84,7 @@ error_log: list[dict] = []
 model_info: dict = {
     "cycles": 0, "loss": 0.0, "initial_loss": 0.0,
     "total_samples": 0, "total_wins": 0,
-    "rockets_found": 0, "rockets_missed": 0, "avg_missed_pnl": 0.0,
+    "rockets_found": 0, "rockets_missed": 0,
     "last_train_ts": 0, "last_save_time": "---", "file_size_kb": 0,
 }
 
@@ -82,6 +94,7 @@ telegram_state: dict = {
     "stats": stats,
     "errors": error_log,
     "model_info": model_info,
+    "batch_state": batch_state,
     "bet_size": BET_SIZE_USD,
     "ws_connected": False,
     "ml_running": False,
@@ -295,16 +308,18 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["ml_label"] = label
             token["ml_confidence"] = confidence
 
-            if label == "trash" and buys >= MIN_BUYS_FOR_SIGNAL:
-                feat_snap = [float(token.get(f, 0) or 0) for f in FEATURES]
-                missed_tokens.append({
-                    "mint": mint,
-                    "symbol": token["symbol"],
-                    "features": feat_snap,
-                    "eval_ts": now,
-                    "entry_v_sol": v_sol,
-                    "entry_v_tokens": v_tokens,
-                })
+            feat_snap = [float(token.get(f, 0) or 0) for f in FEATURES]
+            current_batch_tokens[mint] = {
+                "mint": mint,
+                "symbol": token["symbol"],
+                "features": feat_snap,
+                "eval_ts": now,
+                "entry_v_sol": v_sol,
+                "entry_v_tokens": v_tokens,
+                "ml_label": label,
+                "confidence": confidence,
+            }
+            batch_state["current_count"] = len(current_batch_tokens)
 
             if confidence >= 25 or debug_count[0] < 10:
                 debug_count[0] += 1
@@ -892,9 +907,10 @@ async def report_printer():
         log.info("\n%s", report)
 
 
-INCREMENTAL_INTERVAL = 600
-incremental_trained_mints: set[str] = set()
-resolved_missed: list[dict] = []
+MEMORY_CLEANUP_INTERVAL = 1800
+TOKEN_MAX_AGE = 3600
+HOURLY_STATS_FILE = os.path.join(DATA_DIR, "hourly_stats.json")
+MODEL_SNAPSHOT_INTERVAL = 14400
 
 
 def _update_model_file_info():
@@ -904,11 +920,25 @@ def _update_model_file_info():
         model_info["last_save_time"] = datetime.fromtimestamp(
             os.path.getmtime(entry_path), tz=timezone.utc
         ).strftime("%H:%M:%S UTC")
-MEMORY_CLEANUP_INTERVAL = 1800
-TOKEN_MAX_AGE = 1800
 
 
-def calc_missed_pnl(entry_v_sol, entry_v_tokens, cur_v_sol, cur_v_tokens):
+def get_reward_weight(pnl: float) -> float:
+    if pnl >= 200:
+        return 10.0
+    if pnl >= 100:
+        return 7.0
+    if pnl >= 50:
+        return 5.0
+    if pnl >= 20:
+        return 3.0
+    if pnl >= 5:
+        return 2.0
+    if pnl <= -10:
+        return 2.0
+    return 1.0
+
+
+def calc_token_pnl(entry_v_sol, entry_v_tokens, cur_v_sol, cur_v_tokens):
     if entry_v_sol <= 0 or entry_v_tokens <= 0:
         return None
     if cur_v_sol <= 0 or cur_v_tokens <= 0:
@@ -930,132 +960,80 @@ def calc_missed_pnl(entry_v_sol, entry_v_tokens, cur_v_sol, cur_v_tokens):
     return ((net_out / sol_amount) - 1) * 100
 
 
-async def missed_token_checker():
-    while True:
-        await asyncio.sleep(60)
+async def _process_batch(batch_id: int, batch_tokens: dict):
+    global entry_model
+    total = len(batch_tokens)
+    batch_state["checking_id"] = batch_id
+    batch_state["checking_total"] = total
+    batch_state["checking_progress"] = 0
+    batch_state["checking_samples"] = 0
+
+    samples = []
+    rockets_found = 0
+    predicted_rockets = 0
+    correct_rockets = 0
+    correct_trash = 0
+
+    unchecked = set(batch_tokens.keys())
+    while unchecked:
+        await asyncio.sleep(10)
         now = time.time()
-        pending = [m for m in missed_tokens
-                   if m["mint"] not in missed_trained_mints
-                   and now - m["eval_ts"] >= MISSED_CHECK_DELAY]
-        if not pending:
-            continue
-
-        checked = 0
-        rockets = 0
-        for mt in pending:
-            missed_trained_mints.add(mt["mint"])
-            token_data = tokens.get(mt["mint"])
-            if not token_data:
+        done_this_round = []
+        for mint in list(unchecked):
+            bt = batch_tokens[mint]
+            age = now - bt["eval_ts"]
+            if age < BATCH_DURATION:
                 continue
-            cur_v_sol = token_data.get("v_sol_in_bonding", 0)
-            cur_v_tokens = token_data.get("v_tokens_in_bonding", 0)
-            hyp_pnl = calc_missed_pnl(
-                mt["entry_v_sol"], mt["entry_v_tokens"],
-                cur_v_sol, cur_v_tokens,
-            )
-            if hyp_pnl is None:
-                continue
-            checked += 1
-            is_profitable = 1.0 if hyp_pnl >= MISSED_PUMP_THRESHOLD else 0.0
-            if hyp_pnl >= 200:
-                weight = 10.0
-            elif hyp_pnl >= 100:
-                weight = 7.0
-            elif hyp_pnl >= 50:
-                weight = 5.0
-            elif hyp_pnl >= 20:
-                weight = 3.0
-            elif hyp_pnl >= 5:
-                weight = 2.0
-            elif hyp_pnl <= -10:
-                weight = 2.0
-            else:
-                weight = 1.0
-            resolved_missed.append({
-                "features": mt["features"],
-                "label": is_profitable,
-                "weight": weight,
-                "pnl": hyp_pnl,
-                "symbol": mt["symbol"],
-            })
-            if is_profitable > 0:
-                rockets += 1
-                log.info(
-                    "MISSED ROCKET: %s hypothetical PNL=+%.0f%% (w=%.1f)",
-                    mt["symbol"], hyp_pnl, weight,
+            token_data = tokens.get(mint)
+            if token_data:
+                cur_v_sol = token_data.get("v_sol_in_bonding", 0)
+                cur_v_tokens = token_data.get("v_tokens_in_bonding", 0)
+                hyp_pnl = calc_token_pnl(
+                    bt["entry_v_sol"], bt["entry_v_tokens"],
+                    cur_v_sol, cur_v_tokens,
                 )
-        if checked > 0:
-            model_info["rockets_missed"] += rockets
-            all_pnls = [r["pnl"] for r in resolved_missed[-checked:] if r.get("pnl")]
-            if all_pnls:
-                model_info["avg_missed_pnl"] = sum(p for p in all_pnls if p > 0) / max(1, len([p for p in all_pnls if p > 0]))
-            log.info(
-                "MISSED CHECK: %d tokens resolved, %d were rockets, %d confirmed trash",
-                checked, rockets, checked - rockets,
-            )
+                if hyp_pnl is not None:
+                    is_profitable = 1.0 if hyp_pnl >= 5.0 else 0.0
+                    weight = get_reward_weight(hyp_pnl)
+                    samples.append({
+                        "features": bt["features"],
+                        "label": is_profitable,
+                        "weight": weight,
+                    })
+                    actually_pumped = hyp_pnl >= 50.0
+                    model_said_rocket = bt["ml_label"] in ("ROCKET", "winner")
+                    if model_said_rocket:
+                        predicted_rockets += 1
+                    if actually_pumped:
+                        rockets_found += 1
+                    if model_said_rocket and actually_pumped:
+                        correct_rockets += 1
+                    if not model_said_rocket and not actually_pumped:
+                        correct_trash += 1
+            done_this_round.append(mint)
 
+        for mint in done_this_round:
+            unchecked.discard(mint)
+            batch_state["checking_progress"] += 1
+            batch_state["checking_samples"] = len(samples)
 
-pending_samples: list[dict] = []
+        if not unchecked:
+            break
+        earliest = min((batch_tokens[m]["eval_ts"] for m in unchecked), default=now)
+        if now - earliest > BATCH_DURATION + 300:
+            batch_state["checking_progress"] += len(unchecked)
+            unchecked.clear()
+            break
 
+    fed_count = len(samples)
+    final_loss = 0.0
+    wins = 0
+    accuracy = 0.0
 
-async def incremental_learner():
-    global entry_model, exit_model
-    telegram_state["learner_running"] = True
-    while True:
-        await asyncio.sleep(INCREMENTAL_INTERVAL)
-        closed = [s for s in signals if s["status"] == "CLOSED" and s["mint"] not in incremental_trained_mints]
-
-        n_new_signals = 0
-        for sig in closed:
-            incremental_trained_mints.add(sig["mint"])
-            snap = sig.get("feature_snapshot")
-            if snap:
-                values = snap
-            else:
-                token_data = tokens.get(sig["mint"], {})
-                values = [float(token_data.get(f, 0) or 0) for f in FEATURES]
-
-            final_pnl = sig.get("close_pnl_pct", 0) or 0
-            is_profitable = 1.0 if final_pnl >= 5.0 else 0.0
-
-            if final_pnl >= 200:
-                weight = 10.0
-            elif final_pnl >= 100:
-                weight = 7.0
-            elif final_pnl >= 50:
-                weight = 5.0
-            elif final_pnl >= 20:
-                weight = 3.0
-            elif final_pnl >= 5:
-                weight = 2.0
-            elif final_pnl <= -10:
-                weight = 2.0
-            else:
-                weight = 1.0
-
-            pending_samples.append({"features": values, "label": is_profitable, "weight": weight})
-            n_new_signals += 1
-
-        n_new_missed = 0
-        while resolved_missed:
-            rm = resolved_missed.pop(0)
-            pending_samples.append({"features": rm["features"], "label": rm["label"], "weight": rm["weight"]})
-            n_new_missed += 1
-
-        total = len(pending_samples)
-        if total < 3:
-            log.info("INCREMENTAL: %d pending samples (need >=3), skipping", total)
-            continue
-
-        log.info("INCREMENTAL: feeding %d samples (%d new signals + %d new missed + %d carried over)...",
-                 total, n_new_signals, n_new_missed, total - n_new_signals - n_new_missed)
-
-        if entry_model is None:
-            continue
-
-        X = np.array([s["features"] for s in pending_samples], dtype=np.float32)
-        y = np.array([s["label"] for s in pending_samples], dtype=np.float32)
-        w = np.array([s["weight"] for s in pending_samples], dtype=np.float32)
+    if fed_count >= 3 and entry_model is not None:
+        X = np.array([s["features"] for s in samples], dtype=np.float32)
+        y = np.array([s["label"] for s in samples], dtype=np.float32)
+        w = np.array([s["weight"] for s in samples], dtype=np.float32)
         X_n = (X - entry_mean) / entry_std
 
         X_t = torch.from_numpy(X_n)
@@ -1076,20 +1054,6 @@ async def incremental_learner():
 
         wins = int(y.sum())
         final_loss = loss.item()
-        log.info(
-            "INCREMENTAL: trained on %d samples (%d wins, %.0f%%) | loss=%.4f",
-            total, wins, wins / total * 100, final_loss,
-        )
-
-        model_info["cycles"] += 1
-        model_info["loss"] = final_loss
-        if model_info["initial_loss"] == 0:
-            model_info["initial_loss"] = final_loss
-        model_info["total_samples"] += total
-        model_info["total_wins"] += wins
-        model_info["last_train_ts"] = time.time()
-
-        pending_samples.clear()
 
         entry_path = os.path.join(DATA_DIR, "entry_model.pt")
         torch.save({
@@ -1099,7 +1063,175 @@ async def incremental_learner():
             "std": entry_std.tolist(),
         }, entry_path)
         _update_model_file_info()
-        log.info("INCREMENTAL: model saved to %s", entry_path)
+
+        total_correct = correct_rockets + correct_trash
+        accuracy = total_correct / max(1, fed_count) * 100
+
+        log.info(
+            "BATCH #%d FED: %d/%d tokens | %d rockets | %d wins (%.0f%%) | "
+            "loss=%.4f | accuracy=%.1f%%",
+            batch_id, fed_count, total, rockets_found,
+            wins, wins / max(1, fed_count) * 100, final_loss, accuracy,
+        )
+
+        model_info["cycles"] += 1
+        model_info["loss"] = final_loss
+        if model_info["initial_loss"] == 0:
+            model_info["initial_loss"] = final_loss
+        model_info["total_samples"] += fed_count
+        model_info["total_wins"] += wins
+        model_info["last_train_ts"] = time.time()
+        model_info["rockets_found"] += predicted_rockets
+        model_info["rockets_missed"] += rockets_found
+    else:
+        log.info("BATCH #%d: %d valid samples (need >=3), skipping", batch_id, fed_count)
+
+    batch_record = {
+        "id": batch_id,
+        "tokens_total": total,
+        "tokens_fed": fed_count,
+        "rockets": rockets_found,
+        "predicted_rockets": predicted_rockets,
+        "correct_rockets": correct_rockets,
+        "accuracy": round(accuracy, 1),
+        "wins": wins,
+        "win_pct": round(wins / max(1, fed_count) * 100, 1),
+        "loss": round(final_loss, 4),
+        "fed_ts": time.time(),
+    }
+    batch_state["history"].append(batch_record)
+    batch_state["total_tokens_fed"] += fed_count
+    batch_state["total_batches"] += 1
+
+    batch_state["checking_id"] = 0
+    batch_state["checking_progress"] = 0
+    batch_state["checking_total"] = 0
+    batch_state["checking_samples"] = 0
+
+
+async def batch_processor():
+    batch_state["current_start"] = time.time()
+    telegram_state["learner_running"] = True
+    processing_task = None
+
+    while True:
+        await asyncio.sleep(30)
+        now = time.time()
+
+        elapsed = now - batch_state["current_start"]
+        if elapsed >= BATCH_DURATION and len(current_batch_tokens) > 0:
+            batch_id = batch_state["current_id"]
+            closed_tokens = dict(current_batch_tokens)
+            current_batch_tokens.clear()
+
+            batch_state["current_id"] += 1
+            batch_state["current_start"] = now
+            batch_state["current_count"] = 0
+
+            log.info(
+                "BATCH #%d closed: %d tokens. Batch #%d collection started.",
+                batch_id, len(closed_tokens), batch_state["current_id"],
+            )
+            pending_batches.append({"id": batch_id, "tokens": closed_tokens})
+
+        if pending_batches and (processing_task is None or processing_task.done()):
+            batch = pending_batches.pop(0)
+            processing_task = asyncio.create_task(
+                _process_batch(batch["id"], batch["tokens"])
+            )
+
+        batch_state["current_count"] = len(current_batch_tokens)
+
+
+async def hourly_stats_saver():
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            now = time.time()
+            hour_ago = now - 3600
+            hour_sigs = [s for s in signals if s.get("signal_time", 0) >= hour_ago]
+            closed_hour = [s for s in hour_sigs if s["status"] == "CLOSED"]
+            wins = sum(1 for s in closed_hour if (s.get("close_pnl_pct", 0) or 0) > 0)
+            losses = len(closed_hour) - wins
+            total_pnl = sum(s.get("pnl_usd", 0) or 0 for s in closed_hour)
+
+            last_acc = batch_state["history"][-1]["accuracy"] if batch_state["history"] else 0
+            snapshot = {
+                "ts": now,
+                "datetime": datetime.now(timezone.utc).isoformat(),
+                "uptime_hours": round((now - stats["start"]) / 3600, 1),
+                "tokens_scanned": stats["total"],
+                "signals_total": stats["signals"],
+                "hour_signals": len(hour_sigs),
+                "hour_closed": len(closed_hour),
+                "hour_wins": wins,
+                "hour_losses": losses,
+                "hour_win_rate": round(wins / max(1, wins + losses) * 100, 1),
+                "hour_pnl_usd": round(total_pnl, 2),
+                "batches_completed": batch_state["total_batches"],
+                "tokens_fed_total": batch_state["total_tokens_fed"],
+                "model_loss": round(model_info["loss"], 4),
+                "model_cycles": model_info["cycles"],
+                "model_accuracy": last_acc,
+            }
+
+            existing = []
+            if os.path.exists(HOURLY_STATS_FILE):
+                try:
+                    with open(HOURLY_STATS_FILE) as f:
+                        existing = json.load(f)
+                except Exception:
+                    pass
+            existing.append(snapshot)
+            with open(HOURLY_STATS_FILE, "w") as f:
+                json.dump(existing, f, indent=2)
+
+            log.info(
+                "HOURLY SNAPSHOT #%d: sigs=%d W=%d L=%d pnl=$%.2f loss=%.4f",
+                len(existing), len(hour_sigs), wins, losses, total_pnl, model_info["loss"],
+            )
+        except Exception as e:
+            log.error("HOURLY SNAPSHOT error: %s", e)
+            log_error(f"Hourly snapshot: {e}")
+
+
+async def model_snapshot_saver():
+    while True:
+        await asyncio.sleep(MODEL_SNAPSHOT_INTERVAL)
+        try:
+            entry_path = os.path.join(DATA_DIR, "entry_model.pt")
+            if not os.path.exists(entry_path):
+                continue
+            hours = int((time.time() - stats["start"]) / 3600)
+            snap_name = f"entry_model_h{hours}.pt"
+            snap_path = os.path.join(DATA_DIR, snap_name)
+            import shutil
+            shutil.copy2(entry_path, snap_path)
+
+            last_acc = batch_state["history"][-1]["accuracy"] if batch_state["history"] else 0
+            meta = {
+                "hour": hours,
+                "cycles": model_info["cycles"],
+                "loss": model_info["loss"],
+                "total_samples": model_info["total_samples"],
+                "total_wins": model_info["total_wins"],
+                "batches": batch_state["total_batches"],
+                "tokens_fed": batch_state["total_tokens_fed"],
+                "accuracy": last_acc,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            }
+            meta_path = os.path.join(DATA_DIR, f"model_meta_h{hours}.json")
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+
+            log.info(
+                "MODEL SNAPSHOT: %s (loss=%.4f, cycles=%d, samples=%d)",
+                snap_name, model_info["loss"], model_info["cycles"],
+                model_info["total_samples"],
+            )
+        except Exception as e:
+            log.error("MODEL SNAPSHOT error: %s", e)
+            log_error(f"Model snapshot: {e}")
 
 
 async def memory_cleanup():
@@ -1107,10 +1239,12 @@ async def memory_cleanup():
         await asyncio.sleep(MEMORY_CLEANUP_INTERVAL)
         now = time.time()
         signal_mints = {s["mint"] for s in signals if s["status"] == "ACTIVE"}
-        missed_pending = {m["mint"] for m in missed_tokens if m["mint"] not in missed_trained_mints}
+        batch_mints = set(current_batch_tokens.keys())
+        for pb in pending_batches:
+            batch_mints.update(pb["tokens"].keys())
         stale = []
         for mint, t in tokens.items():
-            if mint in signal_mints or mint in missed_pending:
+            if mint in signal_mints or mint in batch_mints:
                 continue
             last_trade = t.get("last_trade_time", t.get("created_ts", 0))
             if now - last_trade > TOKEN_MAX_AGE:
@@ -1190,10 +1324,11 @@ async def main():
         price_updater = asyncio.create_task(signal_price_updater())
         enricher = asyncio.create_task(enrich_batch(client))
         reporter = asyncio.create_task(report_printer())
-        learner = asyncio.create_task(incremental_learner())
-        missed_checker = asyncio.create_task(missed_token_checker())
+        batch_proc = asyncio.create_task(batch_processor())
         cleaner = asyncio.create_task(memory_cleanup())
         saver = asyncio.create_task(auto_saver())
+        hourly_saver = asyncio.create_task(hourly_stats_saver())
+        model_snapper = asyncio.create_task(model_snapshot_saver())
 
         if tg_bot:
             await tg_bot.start()
@@ -1206,7 +1341,7 @@ async def main():
                     log.info(
                         "HEARTBEAT: uptime=%.1fh tokens=%d signals=%d missed_tracked=%d",
                         (time.time() - stats["start"]) / 3600,
-                        len(tokens), len(signals), len(missed_tokens),
+                        len(tokens), len(signals), batch_state["total_batches"],
                     )
             except asyncio.CancelledError:
                 log.info("Continuous mode interrupted, shutting down...")
@@ -1222,10 +1357,11 @@ async def main():
         listener.cancel()
         scanner.cancel()
         enricher.cancel()
-        learner.cancel()
-        missed_checker.cancel()
+        batch_proc.cancel()
         cleaner.cancel()
         saver.cancel()
+        hourly_saver.cancel()
+        model_snapper.cancel()
 
         track_extra = 120
         await asyncio.sleep(track_extra)
