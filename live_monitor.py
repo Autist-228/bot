@@ -94,6 +94,13 @@ exit_model_info: dict = {
     "last_train_ts": 0,
 }
 
+shadow_stats: dict = {
+    "total": 0, "wins": 0, "losses": 0,
+    "pnl_usd": 0.0,
+    "ns2_better": 0, "rules_better": 0,
+    "trades": [],
+}
+
 telegram_state: dict = {
     "signals": signals,
     "tokens": tokens,
@@ -106,6 +113,7 @@ telegram_state: dict = {
     "ml_running": False,
     "learner_running": False,
     "exit_model_info": exit_model_info,
+    "shadow_stats": shadow_stats,
 }
 
 
@@ -640,8 +648,20 @@ async def signal_price_updater():
                             "peak": round(sig.get("peak_pnl_pct", 0), 1),
                         })
 
+                    shadow = predict_exit_shadow(sig, current_pnl)
+                    if shadow is not None:
+                        sig["ns2_score"] = round(shadow, 3)
+                        sell_now = shadow >= 0.6
+                        sig["ns2_would_sell"] = sell_now
+                        if sell_now and "ns2_first_sell_time" not in sig:
+                            sig["ns2_first_sell_time"] = time.time()
+                            sig["ns2_first_sell_pnl"] = round(current_pnl, 2)
+                            log.info("NS2 SHADOW SELL %s at pnl=%+.1f%% (score=%.3f)",
+                                     sig["symbol"], current_pnl, shadow)
+
                     reason = check_exit_rules(sig, current_pnl)
                     if reason:
+                        _record_shadow_trade(sig, current_pnl, reason)
                         close_signal(sig, reason, current_pnl)
                     else:
                         remaining = sig["position_remaining_pct"] / 100.0
@@ -859,10 +879,11 @@ def print_signals_report():
                 pnl_str = "waiting..."
 
             total_invested += 1
+            ns2 = sig.get("ns2_score")
+            ns2_str = f" | NS2={ns2:.2f}" if ns2 is not None else ""
             lines.append(
                 f"  {sig['ml_label']} {sig['symbol']} | {pnl_str} | "
-                f"peak={peak_gain:+.1f}% | {age}s ago | "
-                f"buys={sig['buys_at_signal']}"
+                f"peak={peak_gain:+.1f}% | {age}s ago{ns2_str}"
             )
 
     if closed:
@@ -1059,6 +1080,94 @@ def calc_token_pnl(entry_v_sol, entry_v_tokens, cur_v_sol, cur_v_tokens):
 
 
 MAX_EXIT_HOLD_SEC = 900
+
+
+def _record_shadow_trade(sig: dict, close_pnl: float, rule_reason: str):
+    ns2_sell_pnl = sig.get("ns2_first_sell_pnl")
+    if ns2_sell_pnl is not None:
+        ns2_pnl_usd = BET_SIZE_USD * ns2_sell_pnl / 100
+        rules_pnl_usd = BET_SIZE_USD * close_pnl / 100
+        shadow_stats["total"] += 1
+        if ns2_sell_pnl > 0:
+            shadow_stats["wins"] += 1
+        else:
+            shadow_stats["losses"] += 1
+        shadow_stats["pnl_usd"] += ns2_pnl_usd
+        if ns2_sell_pnl > close_pnl:
+            shadow_stats["ns2_better"] += 1
+        else:
+            shadow_stats["rules_better"] += 1
+        trade = {
+            "symbol": sig.get("symbol", "?"),
+            "time": datetime.now(timezone.utc).isoformat(),
+            "ns2_pnl": round(ns2_sell_pnl, 1),
+            "rules_pnl": round(close_pnl, 1),
+            "ns2_usd": round(ns2_pnl_usd, 2),
+            "rules_usd": round(rules_pnl_usd, 2),
+            "rule": rule_reason,
+        }
+        shadow_stats["trades"].append(trade)
+        if len(shadow_stats["trades"]) > 200:
+            shadow_stats["trades"] = shadow_stats["trades"][-200:]
+        log.info("SHADOW TRADE %s: NS2=%+.1f%% vs Rules=%+.1f%% | NS2$=%+.2f",
+                 sig["symbol"], ns2_sell_pnl, close_pnl, ns2_pnl_usd)
+    else:
+        shadow_stats["total"] += 1
+        rules_pnl_usd = BET_SIZE_USD * close_pnl / 100
+        shadow_stats["rules_better"] += 1
+        if close_pnl > 0:
+            shadow_stats["wins"] += 1
+        else:
+            shadow_stats["losses"] += 1
+        shadow_stats["pnl_usd"] += rules_pnl_usd
+        trade = {
+            "symbol": sig.get("symbol", "?"),
+            "time": datetime.now(timezone.utc).isoformat(),
+            "ns2_pnl": None,
+            "rules_pnl": round(close_pnl, 1),
+            "ns2_usd": None,
+            "rules_usd": round(rules_pnl_usd, 2),
+            "rule": rule_reason,
+        }
+        shadow_stats["trades"].append(trade)
+        if len(shadow_stats["trades"]) > 200:
+            shadow_stats["trades"] = shadow_stats["trades"][-200:]
+
+
+def predict_exit_shadow(sig: dict, current_pnl: float) -> float | None:
+    if exit_model is None or exit_mean is None:
+        return None
+    entry_features = sig.get("feature_snapshot", [])
+    if len(entry_features) != len(FEATURES):
+        return None
+    entry_conf = sig.get("ml_confidence", 50.0) / 100.0
+    entry_cost = sig.get("entry_cost_pct", 0)
+    gain = current_pnl - entry_cost
+    peak_gain = sig.get("peak_gain", 0)
+    drop_from_peak = peak_gain - gain
+    elapsed = time.time() - sig["signal_time"]
+    prev_pnl = sig.get("_prev_shadow_pnl", gain)
+    dt = max(1, elapsed - sig.get("_prev_shadow_t", elapsed))
+    velocity = (gain - prev_pnl) / dt
+    sig["_prev_shadow_pnl"] = gain
+    sig["_prev_shadow_t"] = elapsed
+    entry_loss_norm = min(model_info["loss"] / 2.0, 1.0) if model_info["loss"] > 0 else 0.5
+    last_acc = batch_state["history"][-1]["accuracy"] / 100.0 if batch_state["history"] else 0.5
+    pos_features = [
+        gain / 100.0,
+        peak_gain / 100.0,
+        min(elapsed / MAX_EXIT_HOLD_SEC, 1.0),
+        drop_from_peak / 100.0,
+        float(np.clip(velocity, -1, 1)),
+    ]
+    full = list(entry_features) + [entry_conf, entry_loss_norm, last_acc] + pos_features
+    x = np.array([full], dtype=np.float32)
+    if x.shape[1] != exit_mean.shape[0]:
+        return None
+    x_n = (x - exit_mean) / exit_std
+    with torch.no_grad():
+        score = exit_model(torch.from_numpy(x_n)).item()
+    return score
 
 
 def generate_live_exit_samples(sig: dict) -> tuple[list, list]:

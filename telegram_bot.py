@@ -173,8 +173,13 @@ class SniperTelegramBot:
             "\u2501\u2501\u2501 <b>\U0001f9e0 НС1 (ВХОД)</b> \u2501\u2501\u2501",
             f"\U0001f504 Циклов: {cycles} | Съедено: {total_samples:,}",
             f"\U0001f4c9 Loss: {loss:.4f} | Acc: {last_acc:.1f}%" if loss > 0 else "\U0001f4c9 Loss: --- | Acc: ---",
-            "",
         ]
+
+        if check_id > 0:
+            check_pct = int(check_prog / max(1, check_total) * 100)
+            lines.append(f"\U0001f50d Проверка #{check_id}: {check_prog}/{check_total} ({check_pct}%) | {check_samples} годных")
+        else:
+            lines.append(f"\u23f3 Сбор #{cur_id}: {cur_count} ток ({batch_mins}:{batch_secs:02d} / 30:00, {batch_pct}%)")
 
         exit_info = self.state.get("exit_model_info", {})
         ex_cycles = exit_info.get("cycles", 0)
@@ -182,25 +187,33 @@ class SniperTelegramBot:
         ex_samples = exit_info.get("total_samples", 0)
         ex_sigs = exit_info.get("total_signals_used", 0)
 
+        all_sigs = self._get_signals()
+        active_sigs = len([s for s in all_sigs if s.get("status") == "ACTIVE"])
+        closed_sigs = len([s for s in all_sigs if s.get("status") == "CLOSED"])
+
+        shadow = self.state.get("shadow_stats", {})
+        sh_total = shadow.get("total", 0)
+        sh_wins = shadow.get("wins", 0)
+        sh_losses = shadow.get("losses", 0)
+        sh_pnl = shadow.get("pnl_usd", 0)
+        sh_ns2_better = shadow.get("ns2_better", 0)
+
         lines += [
+            "",
             "\u2501\u2501\u2501 <b>\U0001f9e0 НС2 (ВЫХОД)</b> \u2501\u2501\u2501",
+            f"\U0001f4e1 От НС1: {active_sigs} актив / {closed_sigs} закрыто",
         ]
         if ex_cycles > 0:
             lines.append(f"\U0001f504 Циклов: {ex_cycles} | Съедено: {ex_samples:,} из {ex_sigs} сиг")
             lines.append(f"\U0001f4c9 Loss: {ex_loss:.4f}")
         else:
-            lines.append("\u23f3 Ожидание данных...")
-
-        lines += [
-            "",
-            f"\u23f3 <b>Сбор #{cur_id}:</b> {cur_count} токенов ({batch_mins}:{batch_secs:02d} / 30:00, {batch_pct}%)",
-        ]
-
-        if check_id > 0:
-            check_pct = int(check_prog / max(1, check_total) * 100)
-            lines.append(f"\U0001f50d <b>Проверка #{check_id}:</b> {check_prog}/{check_total} ({check_pct}%) | {check_samples} годных")
-        elif batches_eaten > 0:
-            lines.append(f"\u2705 Последний пакет #{batches_eaten} скормлен")
+            lines.append("\u23f3 Ожидание закрытых сигналов для обучения...")
+        if sh_total > 0:
+            sh_wr = sh_wins / sh_total * 100
+            lines.append(f"\U0001f4b0 Paper: {sh_total} сдел | {sh_wr:.0f}% WR ({sh_wins}W/{sh_losses}L)")
+            lines.append(f"\U0001f4b5 Paper P&L: ${sh_pnl:+.2f} | НС2 лучше: {sh_ns2_better}/{sh_total}")
+        else:
+            lines.append("\U0001f4b0 Paper: ждём первых сигналов...")
 
         lines += [
             "",
@@ -237,11 +250,12 @@ class SniperTelegramBot:
             InlineKeyboardButton("\U0001f4e6 НС2 пакеты", callback_data="exit_batch_history"),
         ]
         row3 = [
-            InlineKeyboardButton("\U0001f4ca Часовой лог", callback_data="hourly_log"),
-            InlineKeyboardButton("\U0001f9e0 Модели", callback_data="model"),
+            InlineKeyboardButton("\U0001f4ca Монитор 1ч", callback_data="hourly_log"),
+            InlineKeyboardButton("\U0001f4b0 НС2 торговля", callback_data="shadow_trades_0"),
         ]
         row3b = [
             InlineKeyboardButton("\U0001f4cb Токены", callback_data="tokens_0"),
+            InlineKeyboardButton("\U0001f9e0 Модели", callback_data="model"),
         ]
         row4 = [
             InlineKeyboardButton(f"\u23f0 {period_name}", callback_data="period"),
@@ -349,12 +363,14 @@ class SniperTelegramBot:
                     lines.append(f"   conf={conf:.0f}% | {reason} | {time_str}")
                 else:
                     pnl_val = s.get("pnl_pct")
+                    ns2 = s.get("ns2_score")
+                    ns2_str = f" | NS2={ns2:.2f}" if ns2 is not None else ""
                     if pnl_val is not None:
                         usd = bet * pnl_val / 100
                         lines.append(f"{idx}. {sym} | \U0001f7e1 {pnl_val:+.1f}% (${usd:+.2f})")
                     else:
                         lines.append(f"{idx}. {sym} | \U0001f7e1 ожидание...")
-                    lines.append(f"   conf={conf:.0f}% | открыт | {time_str}")
+                    lines.append(f"   conf={conf:.0f}% | открыт{ns2_str} | {time_str}")
                 lines.append("")
 
         return "\n".join(lines), page, total_pages
@@ -514,34 +530,43 @@ class SniperTelegramBot:
             [InlineKeyboardButton("\U0001f3e0 Главная", callback_data="home")],
         ])
 
-    def _build_hourly_text(self):
+    def _build_hourly_text(self, page=0):
         data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
         stats_file = os.path.join(data_dir, "hourly_stats.json")
 
         lines = [
-            "\U0001f4ca <b>ЧАСОВОЙ ЛОГ</b>",
+            "\U0001f4ca <b>ЧАСОВОЙ ЛОГ (НС1 + НС2)</b>",
             "",
         ]
 
         if not os.path.exists(stats_file):
             lines.append("Данных ещё нет. Первый снимок через ~1 час.")
-            return "\n".join(lines)
+            return "\n".join(lines), 0, 0
 
         try:
             with open(stats_file) as f:
                 snapshots = json.load(f)
         except Exception:
             lines.append("Ошибка чтения файла.")
-            return "\n".join(lines)
+            return "\n".join(lines), 0, 0
 
         if not snapshots:
             lines.append("Снимков ещё нет.")
-            return "\n".join(lines)
+            return "\n".join(lines), 0, 0
 
-        lines.append(f"Всего снимков: {len(snapshots)}")
+        per_page = 12
+        total_pages = max(1, (len(snapshots) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+
+        start_idx = len(snapshots) - (page + 1) * per_page
+        end_idx = len(snapshots) - page * per_page
+        start_idx = max(0, start_idx)
+        page_snaps = snapshots[start_idx:end_idx]
+
+        lines.append(f"Всего: {len(snapshots)} | Стр {page + 1}/{total_pages}")
         lines.append("")
 
-        for snap in reversed(snapshots[-12:]):
+        for snap in reversed(page_snaps):
             dt = snap.get("datetime", "")
             try:
                 t = datetime.fromisoformat(dt).strftime("%d.%m %H:%M")
@@ -550,24 +575,30 @@ class SniperTelegramBot:
             sigs = snap.get("hour_signals", 0)
             w = snap.get("hour_wins", 0)
             lo = snap.get("hour_losses", 0)
-            wr = snap.get("hour_win_rate", 0)
             pnl_val = snap.get("hour_pnl_usd", 0)
             loss_val = snap.get("model_loss", 0)
             acc = snap.get("model_accuracy", 0)
             ex_loss = snap.get("exit_loss", 0)
             ex_cyc = snap.get("exit_cycles", 0)
-            ex_line = f" | НС2: {ex_loss:.4f} ({ex_cyc}ц)" if ex_cyc > 0 else ""
+            ns2 = f" | НС2:{ex_loss:.4f}" if ex_cyc > 0 else ""
             lines.append(
                 f"{t} | {sigs}sig {w}W/{lo}L "
-                f"${pnl_val:+.2f} | НС1: {loss_val:.4f}{ex_line}"
+                f"${pnl_val:+.2f} | НС1:{loss_val:.4f} acc{acc:.0f}%{ns2}"
             )
 
-        return "\n".join(lines)
+        return "\n".join(lines), page, total_pages
 
-    def _build_hourly_keyboard(self):
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f3e0 Главная", callback_data="home")],
-        ])
+    def _build_hourly_keyboard(self, page=0, total_pages=1):
+        nav = []
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("\u25c0 Старше", callback_data=f"hourly_{page + 1}"))
+        if page > 0:
+            nav.append(InlineKeyboardButton("Новее \u25b6", callback_data=f"hourly_{page - 1}"))
+        rows = []
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton("\U0001f3e0 Главная", callback_data="home")])
+        return InlineKeyboardMarkup(rows)
 
     def _build_errors_text(self):
         errors = self._get_errors()
@@ -592,6 +623,79 @@ class SniperTelegramBot:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("\U0001f3e0 Главная", callback_data="home")],
         ])
+
+    def _build_shadow_trades_text(self, page=0):
+        shadow = self.state.get("shadow_stats", {})
+        trades = shadow.get("trades", [])
+        sh_total = shadow.get("total", 0)
+        sh_wins = shadow.get("wins", 0)
+        sh_losses = shadow.get("losses", 0)
+        sh_pnl = shadow.get("pnl_usd", 0)
+        sh_ns2 = shadow.get("ns2_better", 0)
+        sh_rules = shadow.get("rules_better", 0)
+
+        lines = [
+            "\U0001f4b0 <b>НС2 PAPER TRADING</b>",
+            "",
+        ]
+        if sh_total > 0:
+            sh_wr = sh_wins / sh_total * 100
+            lines.append(f"Сделок: {sh_total} | WR: {sh_wr:.0f}% ({sh_wins}W/{sh_losses}L)")
+            lines.append(f"Paper P&L: ${sh_pnl:+.2f}")
+            lines.append(f"НС2 лучше: {sh_ns2} | Правила лучше: {sh_rules}")
+        else:
+            lines.append("Сделок пока нет. Ждём закрытия сигналов...")
+            return "\n".join(lines), 0, 0
+
+        lines.append("")
+
+        per_page = 8
+        total_pages = max(1, (len(trades) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+
+        start_idx = len(trades) - (page + 1) * per_page
+        end_idx = len(trades) - page * per_page
+        start_idx = max(0, start_idx)
+        page_trades = trades[start_idx:end_idx]
+
+        lines.append(f"Стр {page + 1}/{total_pages}")
+        lines.append("")
+
+        for t in reversed(page_trades):
+            sym = t.get("symbol", "?")
+            ns2_pnl = t.get("ns2_pnl")
+            rules_pnl = t.get("rules_pnl", 0)
+            ns2_usd = t.get("ns2_usd")
+            rules_usd = t.get("rules_usd", 0)
+            rule = t.get("rule", "")
+            dt = t.get("time", "")
+            try:
+                ts = datetime.fromisoformat(dt).strftime("%H:%M")
+            except Exception:
+                ts = dt[:5]
+            if ns2_pnl is not None:
+                better = "\u2705" if ns2_pnl > rules_pnl else "\u274c"
+                lines.append(
+                    f"{ts} {sym} | НС2:{ns2_pnl:+.1f}% вс Прав:{rules_pnl:+.1f}% {better}"
+                )
+            else:
+                lines.append(
+                    f"{ts} {sym} | НС2:н/д вс Прав:{rules_pnl:+.1f}%"
+                )
+
+        return "\n".join(lines), page, total_pages
+
+    def _build_shadow_trades_keyboard(self, page=0, total_pages=1):
+        nav = []
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("\u25c0 Старше", callback_data=f"shadow_trades_{page + 1}"))
+        if page > 0:
+            nav.append(InlineKeyboardButton("Новее \u25b6", callback_data=f"shadow_trades_{page - 1}"))
+        rows = []
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton("\U0001f3e0 Главная", callback_data="home")])
+        return InlineKeyboardMarkup(rows)
 
     def _build_period_text(self):
         return "\u23f0 <b>Выберите период для главного экрана:</b>"
@@ -714,10 +818,27 @@ class SniperTelegramBot:
             kb = self._build_exit_batch_history_keyboard()
             await self._send_or_edit(chat_id, text, kb, msg_id)
 
-        elif data == "hourly_log":
+        elif data.startswith("shadow_trades_"):
+            self._current_screen = "shadow_trades"
+            page = 0
+            try:
+                page = int(data.split("_")[2])
+            except Exception:
+                page = 0
+            text, page, total_pages = self._build_shadow_trades_text(page)
+            kb = self._build_shadow_trades_keyboard(page, total_pages)
+            await self._send_or_edit(chat_id, text, kb, msg_id)
+
+        elif data == "hourly_log" or data.startswith("hourly_"):
             self._current_screen = "hourly_log"
-            text = self._build_hourly_text()
-            kb = self._build_hourly_keyboard()
+            page = 0
+            if data.startswith("hourly_"):
+                try:
+                    page = int(data.split("_")[1])
+                except Exception:
+                    page = 0
+            text, page, total_pages = self._build_hourly_text(page)
+            kb = self._build_hourly_keyboard(page, total_pages)
             await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data == "errors":
