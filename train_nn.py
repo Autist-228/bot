@@ -35,6 +35,9 @@ ENTRY_FEATURES = [
     "log_max_buy_sol",
     "buy_concentration",
     "sell_speed",
+    "top5_holder_pct",
+    "sniper_count",
+    "num_holders",
 ]
 
 EXIT_POSITION_FEATURES = [
@@ -63,7 +66,7 @@ BONDING_GRAD_SOL = 85.0
 
 
 class EntryNet(nn.Module):
-    def __init__(self, n_features=12):
+    def __init__(self, n_features=15):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, 128),
@@ -85,7 +88,7 @@ class EntryNet(nn.Module):
 
 
 class ExitNet(nn.Module):
-    def __init__(self, n_features=17):
+    def __init__(self, n_features=20):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, 64),
@@ -154,6 +157,33 @@ def extract_entry_features(token, entry_ts):
     buy_conc = unique_buyers / max(1, n_buys)
     s_speed = n_sells / age
 
+    snipers = set()
+    for t in buys:
+        if t["ts"] - created_ts <= 5:
+            tr = t.get("trader", "")
+            if tr:
+                snipers.add(tr)
+    sniper_count = len(snipers)
+
+    buyer_totals = {}
+    for t in pre_entry:
+        tr = t.get("trader", "")
+        if not tr:
+            continue
+        if t["type"] == "buy":
+            buyer_totals[tr] = buyer_totals.get(tr, 0) + t.get("sol", 0)
+        else:
+            buyer_totals[tr] = buyer_totals.get(tr, 0) - t.get("sol", 0)
+    positive = {k: v for k, v in buyer_totals.items() if v > 0}
+    total_pos = sum(positive.values())
+    if total_pos > 0 and len(positive) >= 5:
+        top5 = sorted(positive.values(), reverse=True)[:5]
+        top5_pct = sum(top5) / total_pos * 100
+    elif total_pos > 0:
+        top5_pct = 100.0
+    else:
+        top5_pct = 0.0
+
     return {
         "log_buy_sol": np.log1p(first_buy_sol),
         "log_mcap": np.log1p(initial_mcap),
@@ -167,6 +197,9 @@ def extract_entry_features(token, entry_ts):
         "log_max_buy_sol": np.log1p(max_buy_sol),
         "buy_concentration": buy_conc,
         "sell_speed": s_speed,
+        "top5_holder_pct": top5_pct,
+        "sniper_count": float(sniper_count),
+        "num_holders": float(unique_buyers),
     }
 
 

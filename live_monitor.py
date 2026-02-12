@@ -310,6 +310,24 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["buy_concentration"] = len(tc.get("buyers", set())) / max(1, buys)
             token["sell_speed"] = sells / max(1, age)
 
+            buyer_amts = tc.get("buyer_amounts", {})
+            seller_amts = tc.get("seller_amounts", {})
+            net_positions = {}
+            for addr, amt in buyer_amts.items():
+                net_positions[addr] = amt - seller_amts.get(addr, 0)
+            positive = {k: v for k, v in net_positions.items() if v > 0}
+            total_pos = sum(positive.values())
+            if total_pos > 0 and len(positive) >= 5:
+                top5 = sorted(positive.values(), reverse=True)[:5]
+                top5_pct = sum(top5) / total_pos * 100
+            elif total_pos > 0:
+                top5_pct = 100.0
+            else:
+                top5_pct = 0.0
+            token["top5_holder_pct"] = top5_pct
+            token["sniper_count"] = float(len(tc.get("early_buyers", set())))
+            token["num_holders"] = float(len(tc.get("buyers", set())))
+
             label, confidence = predict_token(token)
             token["ml_checked"] = True
             token["ml_label"] = label
@@ -675,6 +693,9 @@ async def listen_pumpportal():
                         "buy_sol": 0, "sell_sol": 0,
                         "max_buy_sol": 0,
                         "buyers": set(), "sellers": set(),
+                        "early_buyers": set(),
+                        "buyer_amounts": {},
+                        "seller_amounts": {},
                     }
                     stats["total"] += 1
 
@@ -706,11 +727,17 @@ async def listen_pumpportal():
                             tc["max_buy_sol"] = sol_amount
                         if trader_key:
                             tc["buyers"].add(trader_key)
+                            tc["buyer_amounts"][trader_key] = tc["buyer_amounts"].get(trader_key, 0) + sol_amount
+                            if mint in tokens:
+                                token_age = time.time() - tokens[mint]["created_ts"]
+                                if token_age <= 5:
+                                    tc["early_buyers"].add(trader_key)
                     else:
                         tc["sells"] += 1
                         tc["sell_sol"] += sol_amount
                         if trader_key:
                             tc["sellers"].add(trader_key)
+                            tc["seller_amounts"][trader_key] = tc["seller_amounts"].get(trader_key, 0) + sol_amount
 
                     new_v_sol = float(msg.get("vSolInBondingCurve") or 0)
                     new_v_tokens = float(msg.get("vTokensInBondingCurve") or 0)
