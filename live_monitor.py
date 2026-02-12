@@ -266,7 +266,7 @@ async def ml_scanner(client: httpx.AsyncClient):
         now = time.time()
         for mint, token in list(tokens.items()):
             age = now - token["created_ts"]
-            if age < 30 or age > 120:
+            if age < 30 or age > 360:
                 continue
             if token.get("ml_checked"):
                 continue
@@ -302,6 +302,13 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["unique_buyers"] = len(tc.get("buyers", set()))
             token["unique_sellers"] = len(tc.get("sellers", set()))
             token["trade_count"] = buys + sells
+
+            bonding_prog = max(0.0, min(100.0, (v_sol - 30.0) / (85.0 - 30.0) * 100))
+            token["bonding_progress"] = bonding_prog
+            token["log_avg_buy_sol"] = np.log1p(tc.get("buy_sol", 0) / max(1, buys))
+            token["log_max_buy_sol"] = np.log1p(tc.get("max_buy_sol", 0))
+            token["buy_concentration"] = len(tc.get("buyers", set())) / max(1, buys)
+            token["sell_speed"] = sells / max(1, age)
 
             label, confidence = predict_token(token)
             token["ml_checked"] = True
@@ -666,6 +673,7 @@ async def listen_pumpportal():
                     trade_counts[mint] = {
                         "buys": 0, "sells": 0,
                         "buy_sol": 0, "sell_sol": 0,
+                        "max_buy_sol": 0,
                         "buyers": set(), "sellers": set(),
                     }
                     stats["total"] += 1
@@ -694,6 +702,8 @@ async def listen_pumpportal():
                     if tx == "buy":
                         tc["buys"] += 1
                         tc["buy_sol"] += sol_amount
+                        if sol_amount > tc.get("max_buy_sol", 0):
+                            tc["max_buy_sol"] = sol_amount
                         if trader_key:
                             tc["buyers"].add(trader_key)
                     else:

@@ -15,7 +15,7 @@ COOLDOWN_DURATION = int(os.getenv("COOLDOWN_DURATION", "900"))
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "1000"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "1500"))
 BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "3.0"))
 MAX_SLOTS = int(os.getenv("MAX_SLOTS", "10"))
 

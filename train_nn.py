@@ -30,6 +30,11 @@ ENTRY_FEATURES = [
     "buyer_rate",
     "sell_pressure",
     "momentum_15_30",
+    "bonding_progress",
+    "log_avg_buy_sol",
+    "log_max_buy_sol",
+    "buy_concentration",
+    "sell_speed",
 ]
 
 EXIT_POSITION_FEATURES = [
@@ -44,7 +49,7 @@ COST_BUY = (1 - PUMPFUN_FEE_PCT) * (1 - BUY_SLIPPAGE_PCT)
 COST_SELL = (1 - PUMPFUN_FEE_PCT) * (1 - SELL_SLIPPAGE_PCT)
 
 ENTRY_AGE_MIN = 30
-ENTRY_AGE_MAX = 120
+ENTRY_AGE_MAX = 360
 MAX_HOLD_SEC = 900
 MAX_GAIN_PCT = 500.0
 SOL_PRICE_USD = 200.0
@@ -53,8 +58,12 @@ PROFITABLE_THRESHOLD = 5.0
 EXIT_SAMPLE_INTERVAL = 5
 
 
+BONDING_START_SOL = 30.0
+BONDING_GRAD_SOL = 85.0
+
+
 class EntryNet(nn.Module):
-    def __init__(self, n_features=8):
+    def __init__(self, n_features=12):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, 128),
@@ -76,7 +85,7 @@ class EntryNet(nn.Module):
 
 
 class ExitNet(nn.Module):
-    def __init__(self, n_features=13):
+    def __init__(self, n_features=17):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, 64),
@@ -134,6 +143,17 @@ def extract_entry_features(token, entry_ts):
     momentum = max(-500.0, min(500.0, momentum))
 
     age = max(1, entry_age)
+
+    sell_sol = sum(t.get("sol", 0) for t in sells)
+    net_sol_in = buy_sol - sell_sol
+    estimated_v_sol = BONDING_START_SOL + max(0, net_sol_in)
+    bonding_progress = max(0.0, min(100.0, (estimated_v_sol - BONDING_START_SOL) / (BONDING_GRAD_SOL - BONDING_START_SOL) * 100))
+
+    avg_buy_sol = buy_sol / max(1, n_buys)
+    max_buy_sol = max((t.get("sol", 0) for t in buys), default=0)
+    buy_conc = unique_buyers / max(1, n_buys)
+    s_speed = n_sells / age
+
     return {
         "log_buy_sol": np.log1p(first_buy_sol),
         "log_mcap": np.log1p(initial_mcap),
@@ -142,6 +162,11 @@ def extract_entry_features(token, entry_ts):
         "buyer_rate": unique_buyers / age,
         "sell_pressure": n_sells / max(1, total) * 100,
         "momentum_15_30": momentum,
+        "bonding_progress": bonding_progress,
+        "log_avg_buy_sol": np.log1p(avg_buy_sol),
+        "log_max_buy_sol": np.log1p(max_buy_sol),
+        "buy_concentration": buy_conc,
+        "sell_speed": s_speed,
     }
 
 
