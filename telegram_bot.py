@@ -379,41 +379,40 @@ class SniperTelegramBot:
             avg_acc = sum(accs) / len(accs) if accs else 0
 
         lines = [
-            "\U0001f9e0 <b>СТАТИСТИКА МОДЕЛИ</b>",
+            "\U0001f9e0 <b>НЕЙРОСЕТИ</b>",
             "",
+            "\u2501\u2501\u2501 <b>НЕЙРОСЕТЬ 1 (ВХОД)</b> \u2501\u2501\u2501",
             f"\U0001f4c1 entry_model.pt ({model_size} KB)",
-            f"\U0001f4c5 Посл. сохранение: {last_save}",
-            "",
-            "\u2501\u2501\u2501 <b>ОБУЧЕНИЕ</b> \u2501\u2501\u2501",
-            f"\U0001f504 Циклов (батчей): {cycles}",
+            f"\U0001f504 Циклов: {cycles}",
             f"\U0001f4c9 Loss: {loss:.4f}{loss_delta}" if loss > 0 else "\U0001f4c9 Loss: ---",
-            f"\U0001f4c8 Начальный loss: {initial_loss:.4f}" if initial_loss > 0 else "",
-            f"\U0001f4ca Samples всего: {total_samples:,}",
+            f"\U0001f4ca Съедено: {total_samples:,} токенов",
             f"\U0001f3c6 Побед: {total_wins:,} ({win_pct:.0f}%)",
-            "",
-            "\u2501\u2501\u2501 <b>КАЧЕСТВО</b> \u2501\u2501\u2501",
-            f"\U0001f3af Accuracy (посл.): {last_acc:.1f}%" if last_acc > 0 else "\U0001f3af Accuracy: ещё нет данных",
-            f"\U0001f4ca Accuracy (ср. 5): {avg_acc:.1f}%" if avg_acc > 0 else "",
-            f"\U0001f680 Реальных ракет найдено: {rockets_found}",
-            "",
-            "\u2501\u2501\u2501 <b>ВЕСА НАГРАД</b> \u2501\u2501\u2501",
-            "\u2265200%: 10 | \u2265100%: 7 | \u226550%: 5",
-            "\u226520%: 3 | \u22655%: 2 | \u2264-10%: 2",
+            f"\U0001f3af Accuracy: {last_acc:.1f}% (ср.5: {avg_acc:.1f}%)" if last_acc > 0 else "\U0001f3af Accuracy: ---",
+            f"\U0001f680 Ракет: {rockets_found}",
         ]
 
         exit_info = self.state.get("exit_model_info", {})
         ex_cycles = exit_info.get("cycles", 0)
         ex_loss = exit_info.get("loss", 0)
+        ex_initial = exit_info.get("initial_loss", 0)
         ex_samples = exit_info.get("total_samples", 0)
         ex_sigs = exit_info.get("total_signals_used", 0)
+
+        ex_loss_delta = ""
+        if ex_initial > 0 and ex_loss > 0:
+            ch = ((ex_loss - ex_initial) / ex_initial) * 100
+            ex_loss_delta = f" ({ch:+.1f}%)"
+
         lines.append("")
-        lines.append("\u2501\u2501\u2501 <b>EXIT NET</b> \u2501\u2501\u2501")
+        lines.append("\u2501\u2501\u2501 <b>НЕЙРОСЕТЬ 2 (ВЫХОД)</b> \u2501\u2501\u2501")
         if ex_cycles > 0:
             lines.append(f"\U0001f504 Циклов: {ex_cycles}")
-            lines.append(f"\U0001f4c9 Loss: {ex_loss:.4f}")
-            lines.append(f"\U0001f4ca Samples: {ex_samples:,} из {ex_sigs} сигналов")
+            lines.append(f"\U0001f4c9 Loss: {ex_loss:.4f}{ex_loss_delta}")
+            lines.append(f"\U0001f4ca Съедено: {ex_samples:,} точек из {ex_sigs} сигналов")
+            lines.append("\U0001f6d1 Статус: учится (выход по правилам)")
         else:
-            lines.append("Ожидание закрытых сигналов...")
+            lines.append("\u23f3 Ожидание закрытых сигналов...")
+            lines.append("\U0001f6d1 Статус: не обучена")
 
         return "\n".join([l for l in lines if l is not None and l != ""])
 

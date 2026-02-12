@@ -153,7 +153,13 @@ def load_model():
     entry_model.eval()
     entry_mean = np.array(state["mean"], dtype=np.float32)
     entry_std = np.array(state["std"], dtype=np.float32)
-    log.info("Entry NN loaded (%d features)", n_feat)
+    saved_info = state.get("model_info")
+    if saved_info:
+        for k, v in saved_info.items():
+            model_info[k] = v
+        log.info("Entry NN loaded (%d features) | restored %d cycles, loss=%.4f", n_feat, model_info["cycles"], model_info["loss"])
+    else:
+        log.info("Entry NN loaded (%d features)", n_feat)
     if os.path.exists(exit_path):
         xs = torch.load(exit_path, map_location="cpu", weights_only=False)
         n_xf = xs["n_features"]
@@ -162,7 +168,13 @@ def load_model():
         exit_model.eval()
         exit_mean = np.array(xs["mean"], dtype=np.float32)
         exit_std = np.array(xs["std"], dtype=np.float32)
-        log.info("Exit NN loaded (%d features)", n_xf)
+        saved_exit_info = xs.get("exit_model_info")
+        if saved_exit_info:
+            for k, v in saved_exit_info.items():
+                exit_model_info[k] = v
+            log.info("Exit NN loaded (%d features) | restored %d cycles, loss=%.4f", n_xf, exit_model_info["cycles"], exit_model_info["loss"])
+        else:
+            log.info("Exit NN loaded (%d features)", n_xf)
     return True
 
 
@@ -964,7 +976,39 @@ async def report_printer():
 MEMORY_CLEANUP_INTERVAL = 1800
 TOKEN_MAX_AGE = 3600
 HOURLY_STATS_FILE = os.path.join(DATA_DIR, "hourly_stats.json")
+BATCH_STATE_FILE = os.path.join(DATA_DIR, "batch_state.json")
 MODEL_SNAPSHOT_INTERVAL = 14400
+
+
+def _save_batch_state():
+    try:
+        save_data = {
+            "current_id": batch_state["current_id"],
+            "history": batch_state["history"][-50:],
+            "total_tokens_fed": batch_state["total_tokens_fed"],
+            "total_batches": batch_state["total_batches"],
+        }
+        with open(BATCH_STATE_FILE, "w") as f:
+            json.dump(save_data, f)
+    except Exception as e:
+        log.error("batch_state save error: %s", e)
+
+
+def _load_batch_state():
+    if not os.path.exists(BATCH_STATE_FILE):
+        return
+    try:
+        with open(BATCH_STATE_FILE) as f:
+            saved = json.load(f)
+        batch_state["current_id"] = saved.get("current_id", 1)
+        batch_state["history"] = saved.get("history", [])
+        batch_state["total_tokens_fed"] = saved.get("total_tokens_fed", 0)
+        batch_state["total_batches"] = saved.get("total_batches", 0)
+        log.info("Batch state restored: %d batches, %d tokens fed, next=#%d",
+                 batch_state["total_batches"], batch_state["total_tokens_fed"],
+                 batch_state["current_id"])
+    except Exception as e:
+        log.error("batch_state load error: %s", e)
 
 
 def _update_model_file_info():
@@ -1176,12 +1220,23 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         wins = int(y.sum())
         final_loss = loss.item()
 
+        model_info["cycles"] += 1
+        model_info["loss"] = final_loss
+        if model_info["initial_loss"] == 0:
+            model_info["initial_loss"] = final_loss
+        model_info["total_samples"] += fed_count
+        model_info["total_wins"] += wins
+        model_info["last_train_ts"] = time.time()
+        model_info["rockets_found"] += predicted_rockets
+        model_info["rockets_missed"] += rockets_found
+
         entry_path = os.path.join(DATA_DIR, "entry_model.pt")
         torch.save({
             "model": entry_model.state_dict(),
             "n_features": len(FEATURES),
             "mean": entry_mean.tolist(),
             "std": entry_std.tolist(),
+            "model_info": dict(model_info),
         }, entry_path)
         _update_model_file_info()
 
@@ -1195,15 +1250,6 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
             wins, wins / max(1, fed_count) * 100, final_loss, accuracy,
         )
 
-        model_info["cycles"] += 1
-        model_info["loss"] = final_loss
-        if model_info["initial_loss"] == 0:
-            model_info["initial_loss"] = final_loss
-        model_info["total_samples"] += fed_count
-        model_info["total_wins"] += wins
-        model_info["last_train_ts"] = time.time()
-        model_info["rockets_found"] += predicted_rockets
-        model_info["rockets_missed"] += rockets_found
     else:
         log.info("BATCH #%d: %d valid samples (need >=3), skipping", batch_id, fed_count)
 
@@ -1264,19 +1310,6 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         exit_mean = 0.9 * exit_mean + 0.1 * new_mean
         exit_std = 0.9 * exit_std + 0.1 * new_std
 
-        exit_path = os.path.join(DATA_DIR, "exit_model.pt")
-        torch.save({
-            "model": exit_model.state_dict(),
-            "n_features": n_exit_features,
-            "mean": exit_mean.tolist(),
-            "std": exit_std.tolist(),
-        }, exit_path)
-
-        log.info(
-            "EXIT BATCH #%d: %d samples from %d signals | loss=%.4f",
-            batch_id, exit_fed, exit_sigs_used, exit_loss_val,
-        )
-
         exit_model_info["cycles"] += 1
         exit_model_info["loss"] = exit_loss_val
         if exit_model_info["initial_loss"] == 0:
@@ -1284,6 +1317,21 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         exit_model_info["total_samples"] += exit_fed
         exit_model_info["total_signals_used"] += exit_sigs_used
         exit_model_info["last_train_ts"] = time.time()
+
+        exit_path = os.path.join(DATA_DIR, "exit_model.pt")
+        torch.save({
+            "model": exit_model.state_dict(),
+            "n_features": n_exit_features,
+            "mean": exit_mean.tolist(),
+            "std": exit_std.tolist(),
+            "exit_model_info": dict(exit_model_info),
+        }, exit_path)
+
+        log.info(
+            "EXIT BATCH #%d: %d samples from %d signals | loss=%.4f",
+            batch_id, exit_fed, exit_sigs_used, exit_loss_val,
+        )
+
     elif exit_fed > 0:
         log.info("EXIT BATCH #%d: %d samples (need >=5), skipping", batch_id, exit_fed)
     else:
@@ -1313,6 +1361,7 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
     batch_state["checking_progress"] = 0
     batch_state["checking_total"] = 0
     batch_state["checking_samples"] = 0
+    _save_batch_state()
 
 
 async def batch_processor():
@@ -1379,6 +1428,9 @@ async def hourly_stats_saver():
                 "model_loss": round(model_info["loss"], 4),
                 "model_cycles": model_info["cycles"],
                 "model_accuracy": last_acc,
+                "exit_loss": round(exit_model_info["loss"], 4),
+                "exit_cycles": exit_model_info["cycles"],
+                "exit_samples": exit_model_info["total_samples"],
             }
 
             existing = []
@@ -1405,36 +1457,44 @@ async def model_snapshot_saver():
     while True:
         await asyncio.sleep(MODEL_SNAPSHOT_INTERVAL)
         try:
-            entry_path = os.path.join(DATA_DIR, "entry_model.pt")
-            if not os.path.exists(entry_path):
-                continue
-            hours = int((time.time() - stats["start"]) / 3600)
-            snap_name = f"entry_model_h{hours}.pt"
-            snap_path = os.path.join(DATA_DIR, snap_name)
             import shutil
-            shutil.copy2(entry_path, snap_path)
-
+            hours = int((time.time() - stats["start"]) / 3600)
             last_acc = batch_state["history"][-1]["accuracy"] if batch_state["history"] else 0
+
+            entry_path = os.path.join(DATA_DIR, "entry_model.pt")
+            if os.path.exists(entry_path):
+                shutil.copy2(entry_path, os.path.join(DATA_DIR, f"entry_model_h{hours}.pt"))
+                log.info("ENTRY SNAPSHOT h%d: loss=%.4f, cycles=%d, samples=%d",
+                         hours, model_info["loss"], model_info["cycles"], model_info["total_samples"])
+
+            exit_path = os.path.join(DATA_DIR, "exit_model.pt")
+            if os.path.exists(exit_path):
+                shutil.copy2(exit_path, os.path.join(DATA_DIR, f"exit_model_h{hours}.pt"))
+                log.info("EXIT SNAPSHOT h%d: loss=%.4f, cycles=%d, samples=%d",
+                         hours, exit_model_info["loss"], exit_model_info["cycles"], exit_model_info["total_samples"])
+
             meta = {
                 "hour": hours,
-                "cycles": model_info["cycles"],
-                "loss": model_info["loss"],
-                "total_samples": model_info["total_samples"],
-                "total_wins": model_info["total_wins"],
+                "entry": {
+                    "cycles": model_info["cycles"],
+                    "loss": model_info["loss"],
+                    "total_samples": model_info["total_samples"],
+                    "total_wins": model_info["total_wins"],
+                    "accuracy": last_acc,
+                },
+                "exit": {
+                    "cycles": exit_model_info["cycles"],
+                    "loss": exit_model_info["loss"],
+                    "total_samples": exit_model_info["total_samples"],
+                    "total_signals_used": exit_model_info["total_signals_used"],
+                },
                 "batches": batch_state["total_batches"],
                 "tokens_fed": batch_state["total_tokens_fed"],
-                "accuracy": last_acc,
                 "saved_at": datetime.now(timezone.utc).isoformat(),
             }
             meta_path = os.path.join(DATA_DIR, f"model_meta_h{hours}.json")
             with open(meta_path, "w") as f:
                 json.dump(meta, f, indent=2)
-
-            log.info(
-                "MODEL SNAPSHOT: %s (loss=%.4f, cycles=%d, samples=%d)",
-                snap_name, model_info["loss"], model_info["cycles"],
-                model_info["total_samples"],
-            )
         except Exception as e:
             log.error("MODEL SNAPSHOT error: %s", e)
             log_error(f"Model snapshot: {e}")
@@ -1505,6 +1565,8 @@ async def main():
     if not load_model():
         log.error("Cannot start without ML model. Run train_nn.py first.")
         return
+
+    _load_batch_state()
 
     if REAL_TRADING:
         init_trader()
