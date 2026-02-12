@@ -1,7 +1,7 @@
 {
-  "trained_at": "2026-02-11T13:56:46.654880+00:00",
+  "trained_at": "2026-02-11T18:36:49.587312+00:00",
   "model_type": "rf",
-  "n_samples": 4318,
+  "n_samples": 8821,
   "n_features": 8,
   "features": [
     "log_buy_sol",
