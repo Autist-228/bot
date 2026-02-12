@@ -400,6 +400,21 @@ class SniperTelegramBot:
             "\u2265200%: 10 | \u2265100%: 7 | \u226550%: 5",
             "\u226520%: 3 | \u22655%: 2 | \u2264-10%: 2",
         ]
+
+        exit_info = self.state.get("exit_model_info", {})
+        ex_cycles = exit_info.get("cycles", 0)
+        ex_loss = exit_info.get("loss", 0)
+        ex_samples = exit_info.get("total_samples", 0)
+        ex_sigs = exit_info.get("total_signals_used", 0)
+        lines.append("")
+        lines.append("\u2501\u2501\u2501 <b>EXIT NET</b> \u2501\u2501\u2501")
+        if ex_cycles > 0:
+            lines.append(f"\U0001f504 Циклов: {ex_cycles}")
+            lines.append(f"\U0001f4c9 Loss: {ex_loss:.4f}")
+            lines.append(f"\U0001f4ca Samples: {ex_samples:,} из {ex_sigs} сигналов")
+        else:
+            lines.append("Ожидание закрытых сигналов...")
+
         return "\n".join([l for l in lines if l is not None and l != ""])
 
     def _build_model_keyboard(self):

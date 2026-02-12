@@ -88,6 +88,12 @@ model_info: dict = {
     "last_train_ts": 0, "last_save_time": "---", "file_size_kb": 0,
 }
 
+exit_model_info: dict = {
+    "cycles": 0, "loss": 0.0, "initial_loss": 0.0,
+    "total_samples": 0, "total_signals_used": 0,
+    "last_train_ts": 0,
+}
+
 telegram_state: dict = {
     "signals": signals,
     "tokens": tokens,
@@ -99,6 +105,7 @@ telegram_state: dict = {
     "ws_connected": False,
     "ml_running": False,
     "learner_running": False,
+    "exit_model_info": exit_model_info,
 }
 
 
@@ -455,6 +462,7 @@ async def ml_scanner(client: httpx.AsyncClient):
                     "sim_v_tokens_at_buy": v_tokens,
                     "bet_usd": BET_SIZE_USD,
                     "feature_snapshot": [float(token.get(f, 0) or 0) for f in FEATURES],
+                    "price_timeline": [],
                 }
                 signals.append(signal)
                 stats["signals"] += 1
@@ -610,6 +618,15 @@ async def signal_price_updater():
                     v_sol = token_data.get("v_sol_in_bonding", 0)
                     v_tokens = token_data.get("v_tokens_in_bonding", 0)
                     sig["current_price_usd"] = bonding_curve_price_usd(v_sol, v_tokens)
+
+                    tl = sig.setdefault("price_timeline", [])
+                    elapsed = time.time() - sig["signal_time"]
+                    if not tl or elapsed - tl[-1]["t"] >= 5:
+                        tl.append({
+                            "t": round(elapsed, 1),
+                            "pnl": round(current_pnl, 1),
+                            "peak": round(sig.get("peak_pnl_pct", 0), 1),
+                        })
 
                     reason = check_exit_rules(sig, current_pnl)
                     if reason:
@@ -997,8 +1014,75 @@ def calc_token_pnl(entry_v_sol, entry_v_tokens, cur_v_sol, cur_v_tokens):
     return ((net_out / sol_amount) - 1) * 100
 
 
+MAX_EXIT_HOLD_SEC = 900
+
+
+def generate_live_exit_samples(sig: dict) -> tuple[list, list]:
+    timeline = sig.get("price_timeline", [])
+    if len(timeline) < 3:
+        return [], []
+    entry_features = sig.get("feature_snapshot", [])
+    if len(entry_features) != len(FEATURES):
+        return [], []
+    entry_conf = sig.get("ml_confidence", 50.0) / 100.0
+    entry_cost = sig.get("entry_cost_pct", 0)
+
+    all_gains = [pt["pnl"] - entry_cost for pt in timeline]
+    overall_peak = max(all_gains)
+    peak_idx = all_gains.index(overall_peak)
+
+    features_list = []
+    labels_list = []
+    running_peak = 0.0
+    prev_gain = all_gains[0]
+
+    for i, pt in enumerate(timeline):
+        gain = all_gains[i]
+        if gain > running_peak:
+            running_peak = gain
+        drop_from_peak = running_peak - gain
+        dt = pt["t"] - timeline[max(0, i - 1)]["t"] if i > 0 else 1
+        velocity = (gain - prev_gain) / max(1, dt) if i > 0 else 0
+        prev_gain = gain
+
+        if i > 0 and i != peak_idx and i % 3 != 0:
+            continue
+
+        pos_features = [
+            gain / 100.0,
+            running_peak / 100.0,
+            min(pt["t"] / MAX_EXIT_HOLD_SEC, 1.0),
+            drop_from_peak / 100.0,
+            float(np.clip(velocity, -1, 1)),
+        ]
+        full_features = list(entry_features) + [entry_conf] + pos_features
+
+        future_gains = all_gains[i + 1:i + 20]
+        if not future_gains:
+            sell_label = 1.0
+        elif i >= peak_idx and drop_from_peak >= 10:
+            sell_label = 1.0
+        elif running_peak >= 20 and drop_from_peak >= 12:
+            sell_label = 0.9
+        elif running_peak >= 15 and gain < 0:
+            sell_label = 1.0
+        elif future_gains and max(future_gains) > gain + 5:
+            sell_label = 0.0
+        elif future_gains and max(future_gains) < gain - 3:
+            sell_label = 0.8
+        elif gain >= overall_peak * 0.85 and gain > 10:
+            sell_label = 0.7
+        else:
+            sell_label = 0.2
+
+        features_list.append(full_features)
+        labels_list.append(sell_label)
+
+    return features_list, labels_list
+
+
 async def _process_batch(batch_id: int, batch_tokens: dict):
-    global entry_model
+    global entry_model, exit_model, exit_mean, exit_std
     total = len(batch_tokens)
     batch_state["checking_id"] = batch_id
     batch_state["checking_total"] = total
@@ -1123,6 +1207,88 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
     else:
         log.info("BATCH #%d: %d valid samples (need >=3), skipping", batch_id, fed_count)
 
+    exit_samples_X = []
+    exit_samples_y = []
+    exit_sigs_used = 0
+    exit_loss_val = 0.0
+    exit_fed = 0
+
+    for sig in signals:
+        if sig["status"] != "CLOSED":
+            continue
+        if sig.get("exit_trained"):
+            continue
+        tl = sig.get("price_timeline", [])
+        if len(tl) < 3:
+            continue
+        xf, xl = generate_live_exit_samples(sig)
+        if xf:
+            exit_samples_X.extend(xf)
+            exit_samples_y.extend(xl)
+            exit_sigs_used += 1
+            sig["exit_trained"] = True
+
+    exit_fed = len(exit_samples_X)
+
+    if exit_fed >= 5:
+        eX = np.array(exit_samples_X, dtype=np.float32)
+        ey = np.array(exit_samples_y, dtype=np.float32)
+        n_exit_features = eX.shape[1]
+
+        if exit_model is None or exit_mean is None or exit_mean.shape[0] != n_exit_features:
+            exit_model = ExitNet(n_exit_features)
+            exit_mean = eX.mean(axis=0)
+            exit_std = eX.std(axis=0)
+            exit_std[exit_std < 1e-6] = 1.0
+            log.info("EXIT MODEL created fresh: %d features (15 entry + 1 conf + 5 position)", n_exit_features)
+
+        eX_n = (eX - exit_mean) / exit_std
+        eX_t = torch.from_numpy(eX_n)
+        ey_t = torch.from_numpy(ey)
+
+        exit_model.train()
+        e_opt = torch.optim.Adam(exit_model.parameters(), lr=1e-4, weight_decay=1e-4)
+        for _ in range(10):
+            e_opt.zero_grad()
+            e_pred = exit_model(eX_t)
+            e_loss = torch.nn.functional.binary_cross_entropy(e_pred, ey_t)
+            e_loss.backward()
+            torch.nn.utils.clip_grad_norm_(exit_model.parameters(), 1.0)
+            e_opt.step()
+        exit_model.eval()
+        exit_loss_val = e_loss.item()
+
+        new_mean = eX.mean(axis=0)
+        new_std = eX.std(axis=0)
+        new_std[new_std < 1e-6] = 1.0
+        exit_mean = 0.9 * exit_mean + 0.1 * new_mean
+        exit_std = 0.9 * exit_std + 0.1 * new_std
+
+        exit_path = os.path.join(DATA_DIR, "exit_model.pt")
+        torch.save({
+            "model": exit_model.state_dict(),
+            "n_features": n_exit_features,
+            "mean": exit_mean.tolist(),
+            "std": exit_std.tolist(),
+        }, exit_path)
+
+        log.info(
+            "EXIT BATCH #%d: %d samples from %d signals | loss=%.4f",
+            batch_id, exit_fed, exit_sigs_used, exit_loss_val,
+        )
+
+        exit_model_info["cycles"] += 1
+        exit_model_info["loss"] = exit_loss_val
+        if exit_model_info["initial_loss"] == 0:
+            exit_model_info["initial_loss"] = exit_loss_val
+        exit_model_info["total_samples"] += exit_fed
+        exit_model_info["total_signals_used"] += exit_sigs_used
+        exit_model_info["last_train_ts"] = time.time()
+    elif exit_fed > 0:
+        log.info("EXIT BATCH #%d: %d samples (need >=5), skipping", batch_id, exit_fed)
+    else:
+        log.info("EXIT BATCH #%d: no closed signals with timelines", batch_id)
+
     batch_record = {
         "id": batch_id,
         "tokens_total": total,
@@ -1134,6 +1300,9 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         "wins": wins,
         "win_pct": round(wins / max(1, fed_count) * 100, 1),
         "loss": round(final_loss, 4),
+        "exit_samples": exit_fed,
+        "exit_signals": exit_sigs_used,
+        "exit_loss": round(exit_loss_val, 4),
         "fed_ts": time.time(),
     }
     batch_state["history"].append(batch_record)
