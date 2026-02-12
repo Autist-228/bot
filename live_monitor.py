@@ -205,8 +205,8 @@ async def enrich_token(client: httpx.AsyncClient, mint: str):
         token["has_socials"] = len(info.get("socials", [])) > 0
         token["enriched"] = True
         stats["enriched"] += 1
-    except Exception:
-        pass
+    except Exception as e:
+        log_error(f"Enrich ошибка {mint[:8]}: {e}")
 
 
 async def enrich_batch(client: httpx.AsyncClient):
@@ -419,6 +419,8 @@ async def ml_scanner(client: httpx.AsyncClient):
                 }
                 signals.append(signal)
                 stats["signals"] += 1
+                if label == "ROCKET":
+                    model_info["rockets_found"] += 1
                 log.info(
                     "*** SIGNAL #%d: %s %s (%s) conf=%.0f%% buys=%d ratio=%.1f | "
                     "sim: %.4f SOL ($%.2f) -> %.0f tokens | entry_cost=%.1f%% ***",
@@ -515,6 +517,7 @@ async def execute_real_buy(sig: dict, sol_amount: float):
             log.error("REAL BUY FAILED %s: %s", sig["symbol"], result["error"])
     except Exception as e:
         log.error("REAL BUY ERROR %s: %s", sig["symbol"], e)
+        log_error(f"BUY ошибка {sig['symbol']}: {e}")
 
 
 async def execute_real_sell(sig: dict, sell_pct: int, reason: str):
@@ -542,6 +545,7 @@ async def execute_real_sell(sig: dict, sell_pct: int, reason: str):
         return result
     except Exception as e:
         log.error("REAL SELL ERROR %s: %s", sig["symbol"], e)
+        log_error(f"SELL ошибка {sig['symbol']}: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -729,10 +733,14 @@ async def listen_pumpportal():
                     stats["trades"] += 1
 
         except websockets.exceptions.ConnectionClosed:
+            telegram_state["ws_connected"] = False
             log.warning("Disconnected, reconnecting in 3s...")
+            log_error("WebSocket отключился")
             await asyncio.sleep(3)
         except Exception as e:
+            telegram_state["ws_connected"] = False
             log.error("Error: %s, reconnecting in 5s...", e)
+            log_error(f"WebSocket ошибка: {e}")
             await asyncio.sleep(5)
         finally:
             if ws:
@@ -956,10 +964,12 @@ async def missed_token_checker():
                 weight = 7.0
             elif hyp_pnl >= 50:
                 weight = 5.0
-            elif hyp_pnl >= MISSED_PUMP_THRESHOLD:
+            elif hyp_pnl >= 20:
                 weight = 3.0
+            elif hyp_pnl >= 5:
+                weight = 2.0
             elif hyp_pnl <= -10:
-                weight = 1.5
+                weight = 2.0
             else:
                 weight = 1.0
             resolved_missed.append({
@@ -1125,6 +1135,7 @@ async def auto_saver():
             log.info("AUTOSAVE: session saved to %s", filepath)
         except Exception as e:
             log.error("AUTOSAVE failed: %s", e)
+            log_error(f"Autosave ошибка: {e}")
 
 
 async def main():
@@ -1205,6 +1216,9 @@ async def main():
                     await tg_bot.stop()
         else:
             await asyncio.sleep(duration)
+
+        if tg_bot:
+            await tg_bot.stop()
 
         log.info(
             "Signal collection ended. Tracking active positions for 2 more minutes..."

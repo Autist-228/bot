@@ -38,6 +38,7 @@ class SniperTelegramBot:
         self.main_message_id = None
         self.session_message_id = None
         self._update_task = None
+        self._current_screen = "main"
 
     def _get_signals(self):
         return self.state.get("signals", [])
@@ -461,11 +462,13 @@ class SniperTelegramBot:
         msg_id = query.message.message_id
 
         if data == "home" or data == "refresh":
+            self._current_screen = "main"
             text = self._build_main_text()
             kb = self._build_main_keyboard()
             self.main_message_id = await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data == "session_start":
+            self._current_screen = "session"
             self.session_active = True
             self.session_start = time.time()
             self.session_signals_snapshot = len(self._get_signals())
@@ -474,44 +477,52 @@ class SniperTelegramBot:
             self.session_message_id = await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data == "session_stop":
+            self._current_screen = "main"
             self.session_active = False
             text = self._build_main_text()
             kb = self._build_main_keyboard()
             self.main_message_id = await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data == "session_view":
+            self._current_screen = "session"
             text = self._build_session_text()
             kb = self._build_session_keyboard()
             self.session_message_id = await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data.startswith("tokens_"):
+            self._current_screen = "tokens"
             page = int(data.split("_")[1])
             text, page, total = self._build_tokens_text(page, session_only=False)
             kb = self._build_tokens_keyboard(page, total, session_only=False)
             await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data.startswith("session_tokens_"):
+            self._current_screen = "tokens"
             page = int(data.split("_")[2])
             text, page, total = self._build_tokens_text(page, session_only=True)
             kb = self._build_tokens_keyboard(page, total, session_only=True)
             await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data == "model":
+            self._current_screen = "model"
             text = self._build_model_text()
             kb = self._build_model_keyboard()
             await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data == "errors":
+            self._current_screen = "errors"
             text = self._build_errors_text()
             kb = self._build_errors_keyboard()
             await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data == "period":
+            self._current_screen = "period"
             text = self._build_period_text()
             kb = self._build_period_keyboard()
             await self._send_or_edit(chat_id, text, kb, msg_id)
 
         elif data.startswith("set_period_"):
+            self._current_screen = "main"
             period_key = data.replace("set_period_", "")
             if period_key in PERIODS:
                 self.current_period = period_key
@@ -526,7 +537,7 @@ class SniperTelegramBot:
         while True:
             await asyncio.sleep(10)
             try:
-                if self.main_message_id and self.chat_id:
+                if self._current_screen == "main" and self.main_message_id and self.chat_id:
                     text = self._build_main_text()
                     kb = self._build_main_keyboard()
                     try:
@@ -540,7 +551,7 @@ class SniperTelegramBot:
                     except Exception:
                         pass
 
-                if self.session_active and self.session_message_id and self.chat_id:
+                if self._current_screen == "session" and self.session_active and self.session_message_id and self.chat_id:
                     text = self._build_session_text()
                     kb = self._build_session_keyboard()
                     try:
