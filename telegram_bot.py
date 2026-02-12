@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -192,11 +192,16 @@ class SniperTelegramBot:
         closed_sigs = len([s for s in all_sigs if s.get("status") == "CLOSED"])
 
         shadow = self.state.get("shadow_stats", {})
-        sh_total = shadow.get("total", 0)
-        sh_wins = shadow.get("wins", 0)
-        sh_losses = shadow.get("losses", 0)
-        sh_pnl = shadow.get("pnl_usd", 0)
-        sh_ns2_better = shadow.get("ns2_better", 0)
+        all_trades = shadow.get("trades", [])
+        period_sec = PERIODS[self.current_period][0]
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=period_sec)
+        cutoff_iso = cutoff.isoformat()
+        period_trades = [t for t in all_trades if t.get("time", "") >= cutoff_iso]
+        sh_total = len(period_trades)
+        sh_wins = len([t for t in period_trades if (t.get("ns2_pnl") or 0) > 0])
+        sh_losses = sh_total - sh_wins
+        sh_pnl = sum(t.get("ns2_usd", 0) or 0 for t in period_trades)
+        sh_ns2_better = len([t for t in period_trades if (t.get("ns2_pnl") is not None and t.get("ns2_pnl", 0) > t.get("rules_pnl", 0))])
 
         lines += [
             "",
@@ -204,16 +209,16 @@ class SniperTelegramBot:
             f"\U0001f4e1 От НС1: {active_sigs} актив / {closed_sigs} закрыто",
         ]
         if ex_cycles > 0:
-            lines.append(f"\U0001f504 Циклов: {ex_cycles} | Съедено: {ex_samples:,} из {ex_sigs} сиг")
+            lines.append(f"\U0001f504 Модель #{ex_cycles} | Съедено: {ex_samples:,} из {ex_sigs} сиг")
             lines.append(f"\U0001f4c9 Loss: {ex_loss:.4f}")
         else:
-            lines.append("\u23f3 Ожидание закрытых сигналов для обучения...")
+            lines.append("\U0001f504 Модель #0 | \u23f3 Ждём первого обучения...")
         if sh_total > 0:
             sh_wr = sh_wins / sh_total * 100
-            lines.append(f"\U0001f4b0 Paper: {sh_total} сдел | {sh_wr:.0f}% WR ({sh_wins}W/{sh_losses}L)")
-            lines.append(f"\U0001f4b5 Paper P&L: ${sh_pnl:+.2f} | НС2 лучше: {sh_ns2_better}/{sh_total}")
+            lines.append(f"\U0001f4b0 Paper ({period_name}): {sh_total} сдел | {sh_wr:.0f}% WR ({sh_wins}W/{sh_losses}L)")
+            lines.append(f"\U0001f4b5 P&L: ${sh_pnl:+.2f} | НС2 лучше: {sh_ns2_better}/{sh_total}")
         else:
-            lines.append("\U0001f4b0 Paper: ждём первых сигналов...")
+            lines.append(f"\U0001f4b0 Paper ({period_name}): нет сделок")
 
         lines += [
             "",
@@ -501,25 +506,39 @@ class SniperTelegramBot:
         ex_samples = exit_info.get("total_samples", 0)
         ex_sigs = exit_info.get("total_signals_used", 0)
 
+        shadow = self.state.get("shadow_stats", {})
+        all_trades = shadow.get("trades", [])
+        sh_total_all = shadow.get("total", 0)
+        sh_wins_all = shadow.get("wins", 0)
+        sh_pnl_all = shadow.get("pnl_usd", 0)
+
         lines = [
-            "\U0001f4e6 <b>НС2 (ВЫХОД) — ИСТОРИЯ ПАКЕТОВ</b>",
+            "\U0001f4e6 <b>НС2 (ВЫХОД) — ИСТОРИЯ МОДЕЛЕЙ</b>",
             "",
-            f"\U0001f504 Циклов: {ex_cycles}",
+            f"\U0001f504 Текущая модель: #{ex_cycles}",
             f"\U0001f4ca Съедено: {ex_samples:,} точек из {ex_sigs} сигналов",
+            f"\U0001f4b0 Paper всего: {sh_total_all} сдел | P&L: ${sh_pnl_all:+.2f}",
             "",
         ]
 
         has_exit = [h for h in history if h.get("exit_samples", 0) > 0]
         if not has_exit:
-            lines.append("Данных по НС2 ещё нет.")
+            lines.append("Моделей ещё нет. Ждём первое обучение...")
         else:
-            for h in reversed(has_exit[-10:]):
+            model_num = 0
+            for h in has_exit:
+                model_num += 1
+            shown = has_exit[-10:]
+            start_num = max(1, model_num - len(shown) + 1)
+            for i, h in enumerate(reversed(shown)):
+                mn = model_num - i
                 bid = h.get("id", 0)
                 e_samp = h.get("exit_samples", 0)
                 e_sigs = h.get("exit_signals", 0)
                 e_loss = h.get("exit_loss", 0)
                 lines.append(
-                    f"#{bid} | {e_samp} точек из {e_sigs} сиг | "
+                    f"Модель #{mn} (пакет #{bid}) | "
+                    f"{e_samp} точек из {e_sigs} сиг | "
                     f"loss={e_loss:.4f}"
                 )
 
