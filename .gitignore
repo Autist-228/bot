@@ -15,3 +15,5 @@ logs/
 data/*
 !data/.gitkeep
 !data/*.pt
+!data/batch_state.json
+!data/nn_meta.json

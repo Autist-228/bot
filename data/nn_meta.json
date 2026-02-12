@@ -1,0 +1,37 @@
+{
+  "version": "v2_neural_net",
+  "trained_at": "2026-02-12T02:45:45.137386+00:00",
+  "entry_features": [
+    "log_buy_sol",
+    "log_mcap",
+    "buy_rate",
+    "volume_rate",
+    "buyer_rate",
+    "sell_pressure",
+    "momentum_15_30",
+    "bonding_progress",
+    "log_avg_buy_sol",
+    "log_max_buy_sol",
+    "buy_concentration",
+    "sell_speed",
+    "top5_holder_pct",
+    "sniper_count",
+    "num_holders"
+  ],
+  "exit_position_features": [
+    "current_pnl",
+    "peak_pnl",
+    "time_held",
+    "drop_from_peak",
+    "pnl_velocity"
+  ],
+  "profitable_threshold": 5.0,
+  "max_gain_pct": 500.0,
+  "cost_buy": 0.9702,
+  "cost_sell": 0.9603,
+  "entry_age_range": [
+    30,
+    360
+  ],
+  "max_hold_sec": 900
+}
