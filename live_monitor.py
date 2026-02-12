@@ -1033,6 +1033,28 @@ def _load_batch_state():
         log.error("batch_state load error: %s", e)
 
 
+def _sync_model_info_from_batches():
+    history = batch_state.get("history", [])
+    if not history:
+        return
+    entry_batches = [h for h in history if h.get("tokens_fed", 0) >= 3]
+    if entry_batches:
+        model_info["cycles"] = 1 + len(entry_batches)
+        model_info["loss"] = entry_batches[-1].get("loss", model_info["loss"])
+        model_info["total_samples"] = sum(h.get("tokens_fed", 0) for h in history)
+        model_info["total_wins"] = sum(h.get("wins", 0) for h in history)
+        log.info("model_info synced from batches: cycles=%d, loss=%.4f, samples=%d",
+                 model_info["cycles"], model_info["loss"], model_info["total_samples"])
+    exit_batches = [h for h in history if h.get("exit_samples", 0) >= 5]
+    if exit_batches:
+        exit_model_info["cycles"] = 1 + len(exit_batches)
+        exit_model_info["loss"] = exit_batches[-1].get("exit_loss", exit_model_info["loss"])
+        exit_model_info["total_samples"] = sum(h.get("exit_samples", 0) for h in history)
+        exit_model_info["total_signals_used"] = sum(h.get("exit_signals", 0) for h in history)
+        log.info("exit_model_info synced from batches: cycles=%d, loss=%.4f, samples=%d",
+                 exit_model_info["cycles"], exit_model_info["loss"], exit_model_info["total_samples"])
+
+
 def _update_model_file_info():
     entry_path = os.path.join(DATA_DIR, "entry_model.pt")
     if os.path.exists(entry_path):
@@ -1680,6 +1702,7 @@ async def main():
         return
 
     _load_batch_state()
+    _sync_model_info_from_batches()
 
     if REAL_TRADING:
         init_trader()

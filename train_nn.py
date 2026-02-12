@@ -658,7 +658,7 @@ def backtest(entry_model, test_tokens, entry_mean, entry_std):
     return preds, test_results
 
 
-def save_models(entry_model, exit_model, entry_opt, exit_opt, entry_mean, entry_std, exit_mean, exit_std):
+def save_models(entry_model, exit_model, entry_opt, exit_opt, entry_mean, entry_std, exit_mean, exit_std, n_entry_samples=0, n_exit_samples=0):
     log.info("=" * 60)
     log.info("SAVING MODELS")
     log.info("=" * 60)
@@ -677,7 +677,7 @@ def save_models(entry_model, exit_model, entry_opt, exit_opt, entry_mean, entry_
             "cycles": 1,
             "loss": getattr(entry_model, "_final_loss", 0),
             "initial_loss": 0,
-            "total_samples": int(entry_mean.shape[0]) if hasattr(entry_mean, 'shape') else 0,
+            "total_samples": n_entry_samples,
             "total_wins": 0,
             "rockets_found": 0, "rockets_missed": 0,
             "last_train_ts": time.time(),
@@ -699,7 +699,7 @@ def save_models(entry_model, exit_model, entry_opt, exit_opt, entry_mean, entry_
                 "cycles": 1,
                 "loss": getattr(exit_model, "_final_loss", 0),
                 "initial_loss": 0,
-                "total_samples": 0,
+                "total_samples": n_exit_samples,
                 "total_signals_used": 0,
                 "last_train_ts": time.time(),
             },
@@ -807,7 +807,8 @@ def main():
     backtest(entry_model, test_tokens, entry_mean, entry_std)
 
     save_models(
-        entry_model, exit_model, entry_opt, exit_opt, entry_mean, entry_std, exit_mean, exit_std
+        entry_model, exit_model, entry_opt, exit_opt, entry_mean, entry_std, exit_mean, exit_std,
+        n_entry_samples=len(train_eX), n_exit_samples=len(train_xX),
     )
 
     log.info("=" * 60)
