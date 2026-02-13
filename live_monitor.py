@@ -1405,6 +1405,16 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         X = np.array([s["features"] for s in samples], dtype=np.float32)
         y = np.array([s["label"] for s in samples], dtype=np.float32)
         w = np.array([s["weight"] for s in samples], dtype=np.float32)
+
+        rocket_mask = y > 0.5
+        trash_mask = ~rocket_mask
+        if rocket_mask.any() and trash_mask.any():
+            rocket_sum = w[rocket_mask].sum()
+            trash_sum = w[trash_mask].sum()
+            target = (rocket_sum + trash_sum) / 2
+            w[rocket_mask] *= target / rocket_sum
+            w[trash_mask] *= target / trash_sum
+
         X_n = (X - entry_mean) / entry_std
 
         X_t = torch.from_numpy(X_n)
@@ -1501,6 +1511,16 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         ey_t = torch.from_numpy(ey)
 
         ew = np.array(exit_samples_w, dtype=np.float32)
+
+        sell_mask = ey > 0.5
+        hold_mask = ~sell_mask
+        if sell_mask.any() and hold_mask.any():
+            sell_sum = ew[sell_mask].sum()
+            hold_sum = ew[hold_mask].sum()
+            etarget = (sell_sum + hold_sum) / 2
+            ew[sell_mask] *= etarget / sell_sum
+            ew[hold_mask] *= etarget / hold_sum
+
         ew_t = torch.from_numpy(ew)
 
         exit_model.train()
