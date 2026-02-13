@@ -1082,18 +1082,69 @@ def _update_model_file_info():
 
 
 def get_reward_weight(pnl: float) -> float:
+    if pnl >= 500:
+        return 50.0
     if pnl >= 200:
-        return 10.0
+        return 20.0
     if pnl >= 100:
-        return 7.0
+        return 10.0
     if pnl >= 50:
         return 5.0
     if pnl >= 20:
         return 3.0
     if pnl >= 5:
         return 2.0
-    if pnl <= -10:
+    if pnl >= 0:
+        return 1.5
+    if pnl >= -5:
         return 2.0
+    if pnl >= -15:
+        return 3.0
+    if pnl >= -80:
+        return 4.0
+    return 15.0
+
+
+def get_exit_reward_weight(gain: float, overall_peak: float) -> float:
+    near_peak = overall_peak > 0 and gain >= overall_peak * 0.85
+    if near_peak:
+        if overall_peak >= 100:
+            return 10.0
+        if overall_peak >= 90:
+            return 9.0
+        if overall_peak >= 80:
+            return 8.0
+        if overall_peak >= 70:
+            return 7.0
+        if overall_peak >= 60:
+            return 6.0
+        if overall_peak >= 50:
+            return 5.0
+        if overall_peak >= 40:
+            return 4.0
+        if overall_peak >= 30:
+            return 3.0
+        if overall_peak >= 20:
+            return 2.0
+        if overall_peak >= 10:
+            return 1.5
+        return 1.0
+    if gain < 0 and overall_peak > 5:
+        if gain <= -50:
+            return 10.0
+        if gain <= -40:
+            return 8.0
+        if gain <= -30:
+            return 6.0
+        if gain <= -20:
+            return 5.0
+        if gain <= -15:
+            return 4.0
+        if gain <= -10:
+            return 3.0
+        if gain <= -5:
+            return 2.0
+        return 1.5
     return 1.0
 
 
@@ -1211,13 +1262,13 @@ def predict_exit_shadow(sig: dict, current_pnl: float) -> float | None:
     return score
 
 
-def generate_live_exit_samples(sig: dict) -> tuple[list, list]:
+def generate_live_exit_samples(sig: dict) -> tuple[list, list, list]:
     timeline = sig.get("price_timeline", [])
     if len(timeline) < 3:
-        return [], []
+        return [], [], []
     entry_features = sig.get("feature_snapshot", [])
     if len(entry_features) != len(FEATURES):
-        return [], []
+        return [], [], []
     entry_conf = sig.get("ml_confidence", 50.0) / 100.0
     entry_cost = sig.get("entry_cost_pct", 0)
     entry_loss_norm = min(model_info["loss"] / 2.0, 1.0) if model_info["loss"] > 0 else 0.5
@@ -1229,6 +1280,7 @@ def generate_live_exit_samples(sig: dict) -> tuple[list, list]:
 
     features_list = []
     labels_list = []
+    weights_list = []
     running_peak = 0.0
     prev_gain = all_gains[0]
 
@@ -1271,10 +1323,12 @@ def generate_live_exit_samples(sig: dict) -> tuple[list, list]:
         else:
             sell_label = 0.2
 
+        weight = get_exit_reward_weight(gain, overall_peak)
         features_list.append(full_features)
         labels_list.append(sell_label)
+        weights_list.append(weight)
 
-    return features_list, labels_list
+    return features_list, labels_list, weights_list
 
 
 async def _process_batch(batch_id: int, batch_tokens: dict):
@@ -1407,6 +1461,7 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
 
     exit_samples_X = []
     exit_samples_y = []
+    exit_samples_w = []
     exit_sigs_used = 0
     exit_loss_val = 0.0
     exit_fed = 0
@@ -1419,10 +1474,11 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         tl = sig.get("price_timeline", [])
         if len(tl) < 3:
             continue
-        xf, xl = generate_live_exit_samples(sig)
+        xf, xl, xw = generate_live_exit_samples(sig)
         if xf:
             exit_samples_X.extend(xf)
             exit_samples_y.extend(xl)
+            exit_samples_w.extend(xw)
             exit_sigs_used += 1
             sig["exit_trained"] = True
 
@@ -1444,12 +1500,16 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         eX_t = torch.from_numpy(eX_n)
         ey_t = torch.from_numpy(ey)
 
+        ew = np.array(exit_samples_w, dtype=np.float32)
+        ew_t = torch.from_numpy(ew)
+
         exit_model.train()
         e_opt = torch.optim.Adam(exit_model.parameters(), lr=1e-4, weight_decay=1e-4)
         for _ in range(10):
             e_opt.zero_grad()
             e_pred = exit_model(eX_t)
-            e_loss = torch.nn.functional.binary_cross_entropy(e_pred, ey_t)
+            e_bce = torch.nn.functional.binary_cross_entropy(e_pred, ey_t, reduction="none")
+            e_loss = (ew_t * e_bce).mean()
             e_loss.backward()
             torch.nn.utils.clip_grad_norm_(exit_model.parameters(), 1.0)
             e_opt.step()
