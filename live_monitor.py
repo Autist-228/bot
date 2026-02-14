@@ -1084,6 +1084,10 @@ def _update_model_file_info():
 def get_reward_weight(pnl: float) -> float:
     if pnl >= 500:
         return 50.0
+    if pnl >= 400:
+        return 40.0
+    if pnl >= 300:
+        return 30.0
     if pnl >= 200:
         return 20.0
     if pnl >= 100:
@@ -1102,7 +1106,7 @@ def get_reward_weight(pnl: float) -> float:
         return 3.0
     if pnl >= -80:
         return 4.0
-    return 15.0
+    return 25.0
 
 
 def get_exit_reward_weight(gain: float, overall_peak: float) -> float:
