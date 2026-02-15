@@ -232,26 +232,33 @@ def load_model():
     if os.path.exists(exit_path):
         xs = torch.load(exit_path, map_location="cpu", weights_only=False)
         n_xf = xs["n_features"]
-        exit_model = ExitNet(n_xf)
-        exit_model.load_state_dict(xs["model"], strict=False)
-        exit_model.eval()
-        exit_mean = np.array(xs["mean"], dtype=np.float32)
-        exit_std = np.array(xs["std"], dtype=np.float32)
-        saved_exit_info = xs.get("exit_model_info")
-        if saved_exit_info:
-            for k, v in saved_exit_info.items():
-                exit_model_info[k] = v
-            log.info("Exit NN loaded (%d features) | restored %d cycles, loss=%.4f", n_xf, exit_model_info["cycles"], exit_model_info["loss"])
-        else:
-            exit_model_info["cycles"] = 1
-            log.info("Exit NN loaded (%d features) | pre-trained model", n_xf)
-        exit_optimizer = torch.optim.Adam(exit_model.parameters(), lr=INITIAL_LR, weight_decay=1e-4)
-        if "optimizer" in xs:
-            try:
-                exit_optimizer.load_state_dict(xs["optimizer"])
-                log.info("Exit optimizer restored (persistent)")
-            except Exception:
-                log.info("Exit optimizer created fresh (state mismatch)")
+        try:
+            exit_model = ExitNet(n_xf)
+            exit_model.load_state_dict(xs["model"], strict=True)
+            exit_model.eval()
+            exit_mean = np.array(xs["mean"], dtype=np.float32)
+            exit_std = np.array(xs["std"], dtype=np.float32)
+            saved_exit_info = xs.get("exit_model_info")
+            if saved_exit_info:
+                for k, v in saved_exit_info.items():
+                    exit_model_info[k] = v
+                log.info("Exit NN loaded (%d features) | restored %d cycles, loss=%.4f", n_xf, exit_model_info["cycles"], exit_model_info["loss"])
+            else:
+                exit_model_info["cycles"] = 1
+                log.info("Exit NN loaded (%d features) | pre-trained model", n_xf)
+            exit_optimizer = torch.optim.Adam(exit_model.parameters(), lr=INITIAL_LR, weight_decay=1e-4)
+            if "optimizer" in xs:
+                try:
+                    exit_optimizer.load_state_dict(xs["optimizer"])
+                    log.info("Exit optimizer restored (persistent)")
+                except Exception:
+                    log.info("Exit optimizer created fresh (state mismatch)")
+        except RuntimeError as e:
+            log.warning("Exit model architecture mismatch, will create fresh on first exit batch: %s", e)
+            exit_model = None
+            exit_mean = None
+            exit_std = None
+            exit_optimizer = None
     os.makedirs(DATASET_DIR, exist_ok=True)
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
     os.makedirs(SIGNAL_LOG_DIR, exist_ok=True)
