@@ -1,9 +1,11 @@
 import asyncio
 import json
 import logging
+import math
 import sys
 import time
 import os
+from collections import deque
 from datetime import datetime, timezone
 
 import httpx
@@ -80,6 +82,23 @@ exit_mean = None
 exit_std = None
 seen_mints: set[str] = set()
 
+REPLAY_BUFFER_MAX_BATCHES = 30
+INITIAL_LR = 1e-4
+MIN_LR = 1e-5
+LR_CYCLE_BATCHES = 500
+FOCAL_GAMMA = 2.0
+AUGMENT_COPIES = 3
+AUGMENT_NOISE_STD = 0.05
+MINI_BATCH_SIZE = 64
+MAX_EPOCHS = 20
+EARLY_STOP_PATIENCE = 3
+DATASET_DIR = os.path.join(DATA_DIR, "training_data")
+
+replay_buffer: deque = deque(maxlen=REPLAY_BUFFER_MAX_BATCHES)
+exit_replay_buffer: deque = deque(maxlen=REPLAY_BUFFER_MAX_BATCHES)
+entry_optimizer = None
+exit_optimizer = None
+
 error_log: list[dict] = []
 model_info: dict = {
     "cycles": 0, "loss": 0.0, "initial_loss": 0.0,
@@ -149,6 +168,7 @@ def init_trader():
 
 def load_model():
     global entry_model, exit_model, entry_mean, entry_std, exit_mean, exit_std
+    global entry_optimizer, exit_optimizer
     entry_path = os.path.join(DATA_DIR, "entry_model.pt")
     exit_path = os.path.join(DATA_DIR, "exit_model.pt")
     if not os.path.exists(entry_path):
@@ -157,7 +177,7 @@ def load_model():
     state = torch.load(entry_path, map_location="cpu", weights_only=False)
     n_feat = state["n_features"]
     entry_model = EntryNet(n_feat)
-    entry_model.load_state_dict(state["model"])
+    entry_model.load_state_dict(state["model"], strict=False)
     entry_model.eval()
     entry_mean = np.array(state["mean"], dtype=np.float32)
     entry_std = np.array(state["std"], dtype=np.float32)
@@ -168,11 +188,21 @@ def load_model():
         log.info("Entry NN loaded (%d features) | restored %d cycles, loss=%.4f", n_feat, model_info["cycles"], model_info["loss"])
     else:
         log.info("Entry NN loaded (%d features)", n_feat)
+    current_lr = cosine_lr(model_info["cycles"])
+    entry_optimizer = torch.optim.Adam(entry_model.parameters(), lr=current_lr, weight_decay=1e-4)
+    if "optimizer" in state:
+        try:
+            entry_optimizer.load_state_dict(state["optimizer"])
+            log.info("Entry optimizer restored (persistent)")
+        except Exception:
+            log.info("Entry optimizer created fresh (state mismatch)")
+    else:
+        log.info("Entry optimizer created fresh (no saved state)")
     if os.path.exists(exit_path):
         xs = torch.load(exit_path, map_location="cpu", weights_only=False)
         n_xf = xs["n_features"]
         exit_model = ExitNet(n_xf)
-        exit_model.load_state_dict(xs["model"])
+        exit_model.load_state_dict(xs["model"], strict=False)
         exit_model.eval()
         exit_mean = np.array(xs["mean"], dtype=np.float32)
         exit_std = np.array(xs["std"], dtype=np.float32)
@@ -184,6 +214,14 @@ def load_model():
         else:
             exit_model_info["cycles"] = 1
             log.info("Exit NN loaded (%d features) | pre-trained model", n_xf)
+        exit_optimizer = torch.optim.Adam(exit_model.parameters(), lr=INITIAL_LR, weight_decay=1e-4)
+        if "optimizer" in xs:
+            try:
+                exit_optimizer.load_state_dict(xs["optimizer"])
+                log.info("Exit optimizer restored (persistent)")
+            except Exception:
+                log.info("Exit optimizer created fresh (state mismatch)")
+    os.makedirs(DATASET_DIR, exist_ok=True)
     return True
 
 
@@ -1109,6 +1147,33 @@ def get_reward_weight(pnl: float) -> float:
     return 25.0
 
 
+def pnl_to_soft_label(pnl: float) -> float:
+    if pnl >= 500:
+        return 0.98
+    if pnl >= 200:
+        return 0.95
+    if pnl >= 100:
+        return 0.90
+    if pnl >= 50:
+        return 0.85
+    if pnl >= 20:
+        return 0.75
+    if pnl >= 5:
+        return 0.60
+    if pnl >= 0:
+        return 0.30
+    if pnl >= -5:
+        return 0.15
+    if pnl >= -20:
+        return 0.10
+    return 0.05
+
+
+def cosine_lr(cycle: int) -> float:
+    progress = (cycle % LR_CYCLE_BATCHES) / LR_CYCLE_BATCHES
+    return MIN_LR + 0.5 * (INITIAL_LR - MIN_LR) * (1 + math.cos(math.pi * progress))
+
+
 def get_exit_reward_weight(gain: float, overall_peak: float) -> float:
     near_peak = overall_peak > 0 and gain >= overall_peak * 0.85
     if near_peak:
@@ -1337,6 +1402,7 @@ def generate_live_exit_samples(sig: dict) -> tuple[list, list, list]:
 
 async def _process_batch(batch_id: int, batch_tokens: dict):
     global entry_model, exit_model, exit_mean, exit_std
+    global entry_optimizer, exit_optimizer
     total = len(batch_tokens)
     batch_state["checking_id"] = batch_id
     batch_state["checking_total"] = total
@@ -1368,12 +1434,15 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
                     cur_v_sol, cur_v_tokens,
                 )
                 if hyp_pnl is not None:
-                    is_profitable = 1.0 if hyp_pnl >= 5.0 else 0.0
+                    soft_label = pnl_to_soft_label(hyp_pnl)
+                    hard_label = 1.0 if hyp_pnl >= 5.0 else 0.0
                     weight = get_reward_weight(hyp_pnl)
                     samples.append({
                         "features": bt["features"],
-                        "label": is_profitable,
+                        "label": soft_label,
+                        "hard_label": hard_label,
                         "weight": weight,
+                        "pnl": hyp_pnl,
                     })
                     actually_pumped = hyp_pnl >= 50.0
                     model_said_rocket = bt["ml_label"] in ("ROCKET", "winner")
@@ -1406,11 +1475,56 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
     accuracy = 0.0
 
     if fed_count >= 3 and entry_model is not None:
-        X = np.array([s["features"] for s in samples], dtype=np.float32)
-        y = np.array([s["label"] for s in samples], dtype=np.float32)
-        w = np.array([s["weight"] for s in samples], dtype=np.float32)
+        replay_buffer.append(list(samples))
 
-        rocket_mask = y > 0.5
+        try:
+            batch_save = [{
+                "features": s["features"] if isinstance(s["features"], list) else list(s["features"]),
+                "label": float(s["label"]),
+                "hard_label": float(s["hard_label"]),
+                "weight": float(s["weight"]),
+                "pnl": float(s["pnl"]),
+            } for s in samples]
+            save_path = os.path.join(DATASET_DIR, f"batch_{batch_id:06d}.json")
+            with open(save_path, "w") as f:
+                json.dump({"batch_id": batch_id, "ts": time.time(), "samples": batch_save}, f)
+        except Exception as e:
+            log.warning("Dataset save error: %s", e)
+
+        all_samples = list(samples)
+        for old_batch in list(replay_buffer)[:-1]:
+            for s in old_batch:
+                if s["hard_label"] > 0.5:
+                    all_samples.append(s)
+            n_trash = sum(1 for s in old_batch if s["hard_label"] <= 0.5)
+            if n_trash > 0:
+                n_sample = max(1, n_trash // 5)
+                trash_indices = [i for i, s in enumerate(old_batch) if s["hard_label"] <= 0.5]
+                chosen = np.random.choice(trash_indices, min(n_sample, len(trash_indices)), replace=False)
+                for i in chosen:
+                    all_samples.append(old_batch[i])
+
+        augmented = []
+        for s in all_samples:
+            if s["hard_label"] > 0.5:
+                feat = np.array(s["features"], dtype=np.float32)
+                for _ in range(AUGMENT_COPIES):
+                    noisy = feat + np.random.normal(0, AUGMENT_NOISE_STD, feat.shape).astype(np.float32)
+                    augmented.append({
+                        "features": noisy.tolist(),
+                        "label": s["label"],
+                        "hard_label": s["hard_label"],
+                        "weight": s["weight"] * 0.8,
+                        "pnl": s["pnl"],
+                    })
+        all_samples.extend(augmented)
+
+        X = np.array([s["features"] for s in all_samples], dtype=np.float32)
+        y = np.array([s["label"] for s in all_samples], dtype=np.float32)
+        w = np.array([s["weight"] for s in all_samples], dtype=np.float32)
+        h = np.array([s["hard_label"] for s in all_samples], dtype=np.float32)
+
+        rocket_mask = h > 0.5
         trash_mask = ~rocket_mask
         if rocket_mask.any() and trash_mask.any():
             rocket_sum = w[rocket_mask].sum()
@@ -1425,20 +1539,46 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         y_t = torch.from_numpy(y)
         w_t = torch.from_numpy(w)
 
+        current_lr = cosine_lr(model_info["cycles"])
+        for pg in entry_optimizer.param_groups:
+            pg["lr"] = current_lr
+
         entry_model.train()
-        optimizer = torch.optim.Adam(entry_model.parameters(), lr=1e-4, weight_decay=1e-4)
-        for epoch in range(10):
-            optimizer.zero_grad()
-            pred = entry_model(X_t)
-            bce = torch.nn.functional.binary_cross_entropy(pred, y_t, reduction="none")
-            loss = (w_t * bce).mean()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(entry_model.parameters(), 1.0)
-            optimizer.step()
+        n_samples = len(X_t)
+        best_loss = float("inf")
+        patience_count = 0
+        epochs_run = 0
+        for epoch in range(MAX_EPOCHS):
+            indices = torch.randperm(n_samples)
+            epoch_loss_sum = 0.0
+            n_steps = 0
+            for start in range(0, n_samples, MINI_BATCH_SIZE):
+                end = min(start + MINI_BATCH_SIZE, n_samples)
+                idx = indices[start:end]
+                entry_optimizer.zero_grad()
+                pred = entry_model(X_t[idx])
+                bce = torch.nn.functional.binary_cross_entropy(pred, y_t[idx], reduction="none")
+                pt = pred * y_t[idx] + (1 - pred) * (1 - y_t[idx])
+                focal_weight = (1 - pt).pow(FOCAL_GAMMA)
+                loss = (w_t[idx] * focal_weight * bce).mean()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(entry_model.parameters(), 1.0)
+                entry_optimizer.step()
+                epoch_loss_sum += loss.item()
+                n_steps += 1
+            epoch_loss = epoch_loss_sum / max(1, n_steps)
+            epochs_run = epoch + 1
+            if epoch_loss < best_loss - 1e-4:
+                best_loss = epoch_loss
+                patience_count = 0
+            else:
+                patience_count += 1
+            if patience_count >= EARLY_STOP_PATIENCE:
+                break
         entry_model.eval()
 
-        wins = int(y.sum())
-        final_loss = loss.item()
+        wins = int((np.array([s["hard_label"] for s in samples]) > 0.5).sum())
+        final_loss = best_loss
 
         model_info["cycles"] += 1
         model_info["loss"] = final_loss
@@ -1453,6 +1593,7 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         entry_path = os.path.join(DATA_DIR, "entry_model.pt")
         torch.save({
             "model": entry_model.state_dict(),
+            "optimizer": entry_optimizer.state_dict(),
             "n_features": len(FEATURES),
             "mean": entry_mean.tolist(),
             "std": entry_std.tolist(),
@@ -1463,11 +1604,13 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         total_correct = correct_rockets + correct_trash
         accuracy = total_correct / max(1, fed_count) * 100
 
+        replay_total = sum(len(b) for b in replay_buffer)
         log.info(
-            "BATCH #%d FED: %d/%d tokens | %d rockets | %d wins (%.0f%%) | "
-            "loss=%.4f | accuracy=%.1f%%",
-            batch_id, fed_count, total, rockets_found,
-            wins, wins / max(1, fed_count) * 100, final_loss, accuracy,
+            "BATCH #%d FED: %d/%d tokens (+%d replay+aug=%d total) | %d rockets | "
+            "%d wins (%.0f%%) | loss=%.4f | acc=%.1f%% | lr=%.1e | epochs=%d | buf=%d",
+            batch_id, fed_count, total, len(all_samples) - fed_count, len(all_samples),
+            rockets_found, wins, wins / max(1, fed_count) * 100, final_loss, accuracy,
+            current_lr, epochs_run, replay_total,
         )
 
     else:
@@ -1499,8 +1642,27 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
     exit_fed = len(exit_samples_X)
 
     if exit_fed >= 5:
-        eX = np.array(exit_samples_X, dtype=np.float32)
-        ey = np.array(exit_samples_y, dtype=np.float32)
+        if exit_sigs_used > 0:
+            exit_replay_buffer.append({
+                "X": list(exit_samples_X),
+                "y": list(exit_samples_y),
+                "w": list(exit_samples_w),
+            })
+
+        all_exit_X = list(exit_samples_X)
+        all_exit_y = list(exit_samples_y)
+        all_exit_w = list(exit_samples_w)
+        for old_exit in list(exit_replay_buffer)[:-1]:
+            n_old = len(old_exit["X"])
+            n_sample = max(1, n_old // 3)
+            chosen = np.random.choice(n_old, min(n_sample, n_old), replace=False)
+            for i in chosen:
+                all_exit_X.append(old_exit["X"][i])
+                all_exit_y.append(old_exit["y"][i])
+                all_exit_w.append(old_exit["w"][i])
+
+        eX = np.array(all_exit_X, dtype=np.float32)
+        ey = np.array(all_exit_y, dtype=np.float32)
         n_exit_features = eX.shape[1]
 
         if exit_model is None or exit_mean is None or exit_mean.shape[0] != n_exit_features:
@@ -1508,13 +1670,14 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
             exit_mean = eX.mean(axis=0)
             exit_std = eX.std(axis=0)
             exit_std[exit_std < 1e-6] = 1.0
+            exit_optimizer = torch.optim.Adam(exit_model.parameters(), lr=INITIAL_LR, weight_decay=1e-4)
             log.info("EXIT MODEL created fresh: %d features (15 entry + 1 conf + 2 ns1_stats + 5 position)", n_exit_features)
 
         eX_n = (eX - exit_mean) / exit_std
         eX_t = torch.from_numpy(eX_n)
         ey_t = torch.from_numpy(ey)
 
-        ew = np.array(exit_samples_w, dtype=np.float32)
+        ew = np.array(all_exit_w, dtype=np.float32)
 
         sell_mask = ey > 0.5
         hold_mask = ~sell_mask
@@ -1527,18 +1690,30 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
 
         ew_t = torch.from_numpy(ew)
 
+        if exit_optimizer is None:
+            exit_optimizer = torch.optim.Adam(exit_model.parameters(), lr=INITIAL_LR, weight_decay=1e-4)
+
         exit_model.train()
-        e_opt = torch.optim.Adam(exit_model.parameters(), lr=1e-4, weight_decay=1e-4)
-        for _ in range(10):
-            e_opt.zero_grad()
+        e_best_loss = float("inf")
+        e_patience = 0
+        for e_epoch in range(MAX_EPOCHS):
+            exit_optimizer.zero_grad()
             e_pred = exit_model(eX_t)
             e_bce = torch.nn.functional.binary_cross_entropy(e_pred, ey_t, reduction="none")
             e_loss = (ew_t * e_bce).mean()
             e_loss.backward()
             torch.nn.utils.clip_grad_norm_(exit_model.parameters(), 1.0)
-            e_opt.step()
+            exit_optimizer.step()
+            e_loss_val = e_loss.item()
+            if e_loss_val < e_best_loss - 1e-4:
+                e_best_loss = e_loss_val
+                e_patience = 0
+            else:
+                e_patience += 1
+            if e_patience >= EARLY_STOP_PATIENCE:
+                break
         exit_model.eval()
-        exit_loss_val = e_loss.item()
+        exit_loss_val = e_best_loss
 
         new_mean = eX.mean(axis=0)
         new_std = eX.std(axis=0)
@@ -1557,6 +1732,7 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         exit_path = os.path.join(DATA_DIR, "exit_model.pt")
         torch.save({
             "model": exit_model.state_dict(),
+            "optimizer": exit_optimizer.state_dict(),
             "n_features": n_exit_features,
             "mean": exit_mean.tolist(),
             "std": exit_std.tolist(),
@@ -1564,8 +1740,9 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         }, exit_path)
 
         log.info(
-            "EXIT BATCH #%d: %d samples from %d signals | loss=%.4f",
-            batch_id, exit_fed, exit_sigs_used, exit_loss_val,
+            "EXIT BATCH #%d: %d samples (+%d replay=%d total) from %d signals | loss=%.4f",
+            batch_id, exit_fed, len(all_exit_X) - exit_fed, len(all_exit_X),
+            exit_sigs_used, exit_loss_val,
         )
 
     elif exit_fed > 0:
