@@ -1628,7 +1628,7 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
                         correct_rockets += 1
                     if not model_said_rocket and not actually_pumped:
                         correct_trash += 1
-            done_this_round.append(mint)
+            done_this_round.append(key)
 
         for key in done_this_round:
             unchecked.discard(key)
