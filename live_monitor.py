@@ -82,7 +82,7 @@ exit_mean = None
 exit_std = None
 seen_mints: set[str] = set()
 
-REPLAY_BUFFER_MAX_BATCHES = 30
+REPLAY_BUFFER_MAX_BATCHES = 100
 INITIAL_LR = 1e-4
 MIN_LR = 1e-5
 LR_CYCLE_BATCHES = 500
