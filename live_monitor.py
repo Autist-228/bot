@@ -31,6 +31,9 @@ from config import (
     ROCKET_ONLY,
 )
 
+COST_BUY = (1 - PUMPFUN_FEE_PCT) * (1 - BUY_SLIPPAGE_PCT)
+COST_SELL = (1 - PUMPFUN_FEE_PCT) * (1 - SELL_SLIPPAGE_PCT)
+
 REAL_TRADING = "--real" in sys.argv
 CONTINUOUS = "--continuous" in sys.argv
 trader = None
@@ -82,7 +85,7 @@ exit_mean = None
 exit_std = None
 seen_mints: set[str] = set()
 
-REPLAY_BUFFER_MAX_BATCHES = 250
+REPLAY_BUFFER_MAX_BATCHES = 1000
 INITIAL_LR = 1e-4
 MIN_LR = 1e-5
 LR_CYCLE_BATCHES = 500
@@ -93,6 +96,11 @@ MINI_BATCH_SIZE = 64
 MAX_EPOCHS = 20
 EARLY_STOP_PATIENCE = 3
 DATASET_DIR = os.path.join(DATA_DIR, "training_data")
+SNAPSHOT_DIR = os.path.join(DATA_DIR, "token_snapshots")
+SIGNAL_LOG_DIR = os.path.join(DATA_DIR, "signal_logs")
+
+MULTI_EVAL_CHECKPOINTS = [15, 30, 60, 120, 1800]
+JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 
 replay_buffer: deque = deque(maxlen=REPLAY_BUFFER_MAX_BATCHES)
 exit_replay_buffer: deque = deque(maxlen=REPLAY_BUFFER_MAX_BATCHES)
@@ -171,33 +179,56 @@ def load_model():
     global entry_optimizer, exit_optimizer
     entry_path = os.path.join(DATA_DIR, "entry_model.pt")
     exit_path = os.path.join(DATA_DIR, "exit_model.pt")
+    n_current = len(FEATURES)
     if not os.path.exists(entry_path):
-        log.error("No entry model at %s", entry_path)
-        return False
+        log.info("No saved model, creating fresh EntryNet with %d features", n_current)
+        entry_model = EntryNet(n_current)
+        entry_model.eval()
+        entry_mean = np.zeros(n_current, dtype=np.float32)
+        entry_std = np.ones(n_current, dtype=np.float32)
+        current_lr = cosine_lr(0)
+        entry_optimizer = torch.optim.Adam(entry_model.parameters(), lr=current_lr, weight_decay=1e-4)
+        os.makedirs(DATASET_DIR, exist_ok=True)
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        os.makedirs(SIGNAL_LOG_DIR, exist_ok=True)
+        return True
     state = torch.load(entry_path, map_location="cpu", weights_only=False)
     n_feat = state["n_features"]
-    entry_model = EntryNet(n_feat)
-    entry_model.load_state_dict(state["model"], strict=False)
-    entry_model.eval()
-    entry_mean = np.array(state["mean"], dtype=np.float32)
-    entry_std = np.array(state["std"], dtype=np.float32)
-    saved_info = state.get("model_info")
-    if saved_info:
-        for k, v in saved_info.items():
-            model_info[k] = v
-        log.info("Entry NN loaded (%d features) | restored %d cycles, loss=%.4f", n_feat, model_info["cycles"], model_info["loss"])
+    if n_feat != n_current:
+        log.warning("Feature count changed: saved=%d, current=%d. Creating fresh model.", n_feat, n_current)
+        entry_model = EntryNet(n_current)
+        entry_model.eval()
+        entry_mean = np.zeros(n_current, dtype=np.float32)
+        entry_std = np.ones(n_current, dtype=np.float32)
+        model_info["cycles"] = 0
+        model_info["loss"] = 0.0
+        model_info["initial_loss"] = 0.0
+        current_lr = cosine_lr(0)
+        entry_optimizer = torch.optim.Adam(entry_model.parameters(), lr=current_lr, weight_decay=1e-4)
+        log.info("Fresh EntryNet created with %d features (will train from scratch)", n_current)
     else:
-        log.info("Entry NN loaded (%d features)", n_feat)
-    current_lr = cosine_lr(model_info["cycles"])
-    entry_optimizer = torch.optim.Adam(entry_model.parameters(), lr=current_lr, weight_decay=1e-4)
-    if "optimizer" in state:
-        try:
-            entry_optimizer.load_state_dict(state["optimizer"])
-            log.info("Entry optimizer restored (persistent)")
-        except Exception:
-            log.info("Entry optimizer created fresh (state mismatch)")
-    else:
-        log.info("Entry optimizer created fresh (no saved state)")
+        entry_model = EntryNet(n_feat)
+        entry_model.load_state_dict(state["model"], strict=False)
+        entry_model.eval()
+        entry_mean = np.array(state["mean"], dtype=np.float32)
+        entry_std = np.array(state["std"], dtype=np.float32)
+        saved_info = state.get("model_info")
+        if saved_info:
+            for k, v in saved_info.items():
+                model_info[k] = v
+            log.info("Entry NN loaded (%d features) | restored %d cycles, loss=%.4f", n_feat, model_info["cycles"], model_info["loss"])
+        else:
+            log.info("Entry NN loaded (%d features)", n_feat)
+        current_lr = cosine_lr(model_info["cycles"])
+        entry_optimizer = torch.optim.Adam(entry_model.parameters(), lr=current_lr, weight_decay=1e-4)
+        if "optimizer" in state:
+            try:
+                entry_optimizer.load_state_dict(state["optimizer"])
+                log.info("Entry optimizer restored (persistent)")
+            except Exception:
+                log.info("Entry optimizer created fresh (state mismatch)")
+        else:
+            log.info("Entry optimizer created fresh (no saved state)")
     if os.path.exists(exit_path):
         xs = torch.load(exit_path, map_location="cpu", weights_only=False)
         n_xf = xs["n_features"]
@@ -222,6 +253,8 @@ def load_model():
             except Exception:
                 log.info("Exit optimizer created fresh (state mismatch)")
     os.makedirs(DATASET_DIR, exist_ok=True)
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    os.makedirs(SIGNAL_LOG_DIR, exist_ok=True)
     return True
 
 
@@ -332,9 +365,18 @@ async def ml_scanner(client: httpx.AsyncClient):
         now = time.time()
         for mint, token in list(tokens.items()):
             age = now - token["created_ts"]
-            if age < 30 or age > 360:
+            if age > 1800:
                 continue
-            if token.get("ml_checked"):
+            if token.get("ml_skip"):
+                continue
+
+            checkpoints_done = token.get("ml_checkpoints_done", [])
+            checkpoint_hit = None
+            for cp in MULTI_EVAL_CHECKPOINTS:
+                if cp not in checkpoints_done and age >= cp:
+                    checkpoint_hit = cp
+                    break
+            if checkpoint_hit is None:
                 continue
 
             tc = trade_counts.get(mint, {})
@@ -343,7 +385,7 @@ async def ml_scanner(client: httpx.AsyncClient):
             if buys < MIN_BUYS_FOR_SIGNAL:
                 continue
             if buys > MAX_BUYS_FOR_SIGNAL:
-                token["ml_checked"] = True
+                token["ml_skip"] = True
                 continue
 
             v_sol = token.get("v_sol_in_bonding", 0)
@@ -351,33 +393,37 @@ async def ml_scanner(client: httpx.AsyncClient):
             cur_price = bonding_curve_price_usd(v_sol, v_tokens)
             p15 = token.get("price_snap_15s", 0)
             p30 = token.get("price_snap_30s", 0)
+            buy_sol_total = tc.get("buy_sol", 0)
+            sell_sol_total = tc.get("sell_sol", 0)
+            unique_buyers_set = tc.get("buyers", set())
+            unique_sellers_set = tc.get("sellers", set())
+            buyer_amts = tc.get("buyer_amounts", {})
+            seller_amts = tc.get("seller_amounts", {})
+
             token["log_buy_sol"] = np.log1p(token.get("initial_buy_sol", 0))
             token["log_mcap"] = np.log1p(token.get("initial_mcap_usd", 0))
             token["buy_rate"] = buys / max(1, age)
-            token["volume_rate"] = tc.get("buy_sol", 0) / max(1, age)
-            token["buyer_rate"] = len(tc.get("buyers", set())) / max(1, age)
+            token["volume_rate"] = buy_sol_total / max(1, age)
+            token["buyer_rate"] = len(unique_buyers_set) / max(1, age)
             total_trades = buys + sells
             raw_mom = ((p30 / p15) - 1) * 100 if p15 > 0 and p30 > 0 else 0.0
             token["momentum_15_30"] = max(-500.0, min(500.0, raw_mom))
             token["total_buys"] = buys
             token["total_sells"] = sells
-            token["total_buy_sol"] = tc.get("buy_sol", 0)
-            token["total_sell_sol"] = tc.get("sell_sol", 0)
-            token["buy_sell_ratio"] = round(buys / max(1, sells), 2)
-            token["sell_pressure"] = round(sells / max(1, buys + sells) * 100, 1)
-            token["unique_buyers"] = len(tc.get("buyers", set()))
-            token["unique_sellers"] = len(tc.get("sellers", set()))
-            token["trade_count"] = buys + sells
+            token["total_buy_sol"] = buy_sol_total
+            token["total_sell_sol"] = sell_sol_total
+            token["sell_pressure"] = round(sells / max(1, total_trades) * 100, 1)
+            token["unique_buyers"] = len(unique_buyers_set)
+            token["unique_sellers"] = len(unique_sellers_set)
+            token["trade_count"] = total_trades
 
             bonding_prog = max(0.0, min(100.0, (v_sol - 30.0) / (85.0 - 30.0) * 100))
             token["bonding_progress"] = bonding_prog
-            token["log_avg_buy_sol"] = np.log1p(tc.get("buy_sol", 0) / max(1, buys))
+            token["log_avg_buy_sol"] = np.log1p(buy_sol_total / max(1, buys))
             token["log_max_buy_sol"] = np.log1p(tc.get("max_buy_sol", 0))
-            token["buy_concentration"] = len(tc.get("buyers", set())) / max(1, buys)
+            token["buy_concentration"] = len(unique_buyers_set) / max(1, buys)
             token["sell_speed"] = sells / max(1, age)
 
-            buyer_amts = tc.get("buyer_amounts", {})
-            seller_amts = tc.get("seller_amounts", {})
             net_positions = {}
             for addr, amt in buyer_amts.items():
                 net_positions[addr] = amt - seller_amts.get(addr, 0)
@@ -392,15 +438,46 @@ async def ml_scanner(client: httpx.AsyncClient):
                 top5_pct = 0.0
             token["top5_holder_pct"] = top5_pct
             token["sniper_count"] = float(len(tc.get("early_buyers", set())))
-            token["num_holders"] = float(len(tc.get("buyers", set())))
+            token["num_holders"] = float(len(unique_buyers_set))
+
+            max_buy_sol = tc.get("max_buy_sol", 0)
+            token["log_volume_sol"] = np.log1p(buy_sol_total)
+            token["buy_sell_ratio"] = round(buys / max(1, sells), 2)
+            token["whale_buy_pct"] = max_buy_sol / max(0.01, buy_sol_total) * 100
+            dev_addr = token.get("dev_address", "")
+            dev_bought = buyer_amts.get(dev_addr, 0) if dev_addr else 0
+            dev_sold = seller_amts.get(dev_addr, 0) if dev_addr else 0
+            dev_bal_pct = (dev_bought - dev_sold) / max(0.01, buy_sol_total) * 100
+            token["dev_balance_pct"] = max(-100.0, min(100.0, dev_bal_pct))
+            init_price = token.get("initial_price_usd", 0)
+            pv = 0.0
+            if init_price > 0 and cur_price > 0:
+                pv = ((cur_price / init_price) - 1) / max(1, age) * 100
+            token["price_velocity_norm"] = max(-100.0, min(100.0, pv))
+            net_sol = buy_sol_total - sell_sol_total
+            token["log_net_sol_flow"] = np.log1p(max(0, net_sol))
+            init_p_usd = token.get("initial_price_usd", 0)
+            p15_usd = token.get("price_snap_15s", 0)
+            mom_0_15 = 0.0
+            if init_p_usd > 0 and p15_usd > 0:
+                mom_0_15 = ((p15_usd / init_p_usd) - 1) * 100
+            token["momentum_0_15"] = max(-500.0, min(500.0, mom_0_15))
+            token["large_buy_count"] = float(sum(1 for amt in buyer_amts.values() if amt >= 1.0))
+            token["token_age_norm"] = min(age / 300.0, 1.0)
+            token["bonding_curve_velocity"] = bonding_prog / max(1, age) * 60
+            overlap = len(unique_sellers_set & unique_buyers_set)
+            token["seller_buyer_overlap"] = overlap / max(1, len(unique_sellers_set)) if unique_sellers_set else 0.0
+            token["sell_to_buy_sol_ratio"] = sell_sol_total / max(0.01, buy_sol_total)
+            token["holder_net_pct"] = len(positive) / max(1, len(unique_buyers_set)) * 100 if unique_buyers_set else 0.0
 
             label, confidence = predict_token(token)
-            token["ml_checked"] = True
+            token.setdefault("ml_checkpoints_done", []).append(checkpoint_hit)
             token["ml_label"] = label
             token["ml_confidence"] = confidence
 
             feat_snap = [float(token.get(f, 0) or 0) for f in FEATURES]
-            current_batch_tokens[mint] = {
+            batch_key = f"{mint}_cp{checkpoint_hit}"
+            current_batch_tokens[batch_key] = {
                 "mint": mint,
                 "symbol": token["symbol"],
                 "features": feat_snap,
@@ -409,18 +486,31 @@ async def ml_scanner(client: httpx.AsyncClient):
                 "entry_v_tokens": v_tokens,
                 "ml_label": label,
                 "confidence": confidence,
+                "checkpoint": checkpoint_hit,
+                "token_age": round(age, 1),
+                "entry_price_usd": cur_price,
+                "bonding_progress": bonding_prog,
+                "raw_data": {
+                    "buys": buys,
+                    "sells": sells,
+                    "buy_sol": round(buy_sol_total, 4),
+                    "sell_sol": round(sell_sol_total, 4),
+                    "unique_buyers": len(unique_buyers_set),
+                    "unique_sellers": len(unique_sellers_set),
+                    "bonding_progress": round(bonding_prog, 1),
+                    "dev_balance_pct": round(dev_bal_pct, 1),
+                },
             }
             batch_state["current_count"] = len(current_batch_tokens)
 
             if confidence >= 25 or debug_count[0] < 10:
                 debug_count[0] += 1
                 log.info(
-                    "ML %s: label=%s conf=%.1f%% age=%.0fs buys=%d buy_rate=%.2f vol_rate=%.3f buyer_rate=%.2f sell_p=%.0f%% mom=%.1f buy_sol=%.4f mcap=%.0f",
-                    token["symbol"], label, confidence, age, buys,
+                    "ML %s: label=%s conf=%.1f%% cp=%ds age=%.0fs buys=%d buy_rate=%.2f vol=%.3f sell_p=%.0f%% mom=%.1f whale=%.0f%% dev=%.0f%%",
+                    token["symbol"], label, confidence, checkpoint_hit, age, buys,
                     token.get("buy_rate", 0), token.get("volume_rate", 0),
-                    token.get("buyer_rate", 0), token.get("sell_pressure", 0),
-                    token.get("momentum_15_30", 0), token.get("initial_buy_sol", 0),
-                    token.get("initial_mcap_usd", 0),
+                    token.get("sell_pressure", 0), token.get("momentum_15_30", 0),
+                    token.get("whale_buy_pct", 0), token.get("dev_balance_pct", 0),
                 )
 
             if label in ("ROCKET", "winner"):
@@ -490,13 +580,14 @@ async def ml_scanner(client: httpx.AsyncClient):
                     "signal_time": signal_time,
                     "signal_at": datetime.now(timezone.utc).isoformat(),
                     "signal_age_sec": int(age),
+                    "signal_checkpoint": checkpoint_hit,
                     "ml_label": label,
                     "ml_confidence": round(confidence, 1),
                     "initial_mcap_usd": initial_mcap,
                     "buys_at_signal": buys,
                     "sells_at_signal": sells,
-                    "buy_ratio_at_signal": token["buy_sell_ratio"],
-                    "sell_pressure_at_signal": token["sell_pressure"],
+                    "buy_ratio_at_signal": token.get("buy_sell_ratio", 0),
+                    "sell_pressure_at_signal": token.get("sell_pressure", 0),
                     "entry_price_usd": entry_price_usd,
                     "entry_v_sol": v_sol,
                     "entry_v_tokens": v_tokens,
@@ -528,10 +619,10 @@ async def ml_scanner(client: httpx.AsyncClient):
                 if label == "ROCKET":
                     model_info["rockets_found"] += 1
                 log.info(
-                    "*** SIGNAL #%d: %s %s (%s) conf=%.0f%% buys=%d ratio=%.1f | "
+                    "*** SIGNAL #%d: %s %s (%s) conf=%.0f%% cp=%ds buys=%d ratio=%.1f | "
                     "sim: %.4f SOL ($%.2f) -> %.0f tokens | entry_cost=%.1f%% ***",
                     stats["signals"], label, token["symbol"], mint[:8],
-                    confidence, buys, token["buy_sell_ratio"],
+                    confidence, checkpoint_hit, buys, token.get("buy_sell_ratio", 0),
                     sim_sol_spent, BET_SIZE_USD, sim_tokens, entry_cost_pct,
                 )
 
@@ -568,12 +659,20 @@ def check_exit_rules(sig: dict, current_pnl: float) -> str | None:
         )
 
     peak_gain = sig.get("peak_gain", 0)
-    if peak_gain >= 30.0:
+    if peak_gain >= 20.0:
+        if peak_gain >= 200:
+            trail_pct = 30.0
+        elif peak_gain >= 100:
+            trail_pct = 25.0
+        elif peak_gain >= 50:
+            trail_pct = 20.0
+        else:
+            trail_pct = TRAILING_STOP_PCT
         drop = peak_gain - gain
-        if drop >= TRAILING_STOP_PCT:
+        if drop >= trail_pct:
             return (
                 f"TRAILING_STOP (peak={peak_gain:+.1f}%, gain={gain:+.1f}%, "
-                f"drop={drop:.1f}%, real_pnl={current_pnl:+.1f}%)"
+                f"drop={drop:.1f}%>={trail_pct:.0f}%, real_pnl={current_pnl:+.1f}%)"
             )
 
     if peak_gain >= 15.0 and gain < 0:
@@ -599,6 +698,14 @@ def close_signal(sig: dict, reason: str, pnl: float):
         sig["ml_label"], sig["symbol"], reason,
         total_pnl_per_dollar * 100, sig["pnl_usd"], BET_SIZE_USD,
     )
+    try:
+        os.makedirs(SIGNAL_LOG_DIR, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(SIGNAL_LOG_DIR, f"{sig['mint']}_{ts}.json")
+        with open(path, "w") as f:
+            json.dump(sig, f, indent=2, default=str)
+    except Exception:
+        pass
 
     if REAL_TRADING and trader and sig.get("real_buy") and sig["position_remaining_pct"] > 0:
         sells_done = sig.get("sells_done", 0)
@@ -655,6 +762,28 @@ async def execute_real_sell(sig: dict, sell_pct: int, reason: str):
         return {"success": False, "error": str(e)}
 
 
+async def _get_post_migration_price_usd(client: httpx.AsyncClient, mint: str) -> float | None:
+    try:
+        r = await client.get(f"https://api.jup.ag/price/v2?ids={mint}", timeout=8)
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            info = data.get(mint)
+            if info and float(info.get("price") or 0) > 0:
+                return float(info["price"]) * 1.0
+    except Exception:
+        pass
+    try:
+        r = await client.get(f"{DEXSCREENER_API}/tokens/v1/solana/{mint}", timeout=8)
+        if r.status_code == 200:
+            pairs = r.json()
+            if pairs and isinstance(pairs, list):
+                px = float(pairs[0].get("priceUsd") or 0)
+                return px if px > 0 else None
+    except Exception:
+        pass
+    return None
+
+
 async def signal_price_updater():
     while True:
         await asyncio.sleep(PRICE_POLL_INTERVAL)
@@ -662,21 +791,36 @@ async def signal_price_updater():
         if not active:
             continue
 
-        for sig in active:
-            try:
-                mint = sig["mint"]
-                token_data = tokens.get(mint, {})
-                current_pnl = calc_bonding_curve_pnl(sig, token_data)
+        async with httpx.AsyncClient(timeout=10) as client:
+            for sig in active:
+                try:
+                    mint = sig["mint"]
+                    token_data = tokens.get(mint, {})
+                    current_pnl = calc_bonding_curve_pnl(sig, token_data)
 
-                if current_pnl is not None:
+                    price_used = None
+                    if current_pnl is None and sig.get("entry_price_usd", 0) > 0:
+                        px = await _get_post_migration_price_usd(client, mint)
+                        if px and px > 0:
+                            price_used = px
+                            gross = (px / sig["entry_price_usd"] - 1) * 100
+                            current_pnl = (COST_BUY * COST_SELL * (1 + gross / 100) - 1) * 100
+
+                    if current_pnl is None:
+                        continue
+
                     sig["pnl_pct"] = round(current_pnl, 1)
                     if current_pnl > sig.get("peak_pnl_pct", 0):
                         sig["peak_pnl_pct"] = round(current_pnl, 1)
                     sig["checked_at"] = datetime.now(timezone.utc).isoformat()
 
-                    v_sol = token_data.get("v_sol_in_bonding", 0)
-                    v_tokens = token_data.get("v_tokens_in_bonding", 0)
-                    sig["current_price_usd"] = bonding_curve_price_usd(v_sol, v_tokens)
+                    if price_used is not None:
+                        sig["current_price_usd"] = price_used
+                        tokens.get(mint, {}).update({"migrated": True}) if mint in tokens else None
+                    else:
+                        v_sol = token_data.get("v_sol_in_bonding", 0)
+                        v_tokens = token_data.get("v_tokens_in_bonding", 0)
+                        sig["current_price_usd"] = bonding_curve_price_usd(v_sol, v_tokens)
 
                     tl = sig.setdefault("price_timeline", [])
                     elapsed = time.time() - sig["signal_time"]
@@ -707,8 +851,8 @@ async def signal_price_updater():
                         unrealized = remaining * (current_pnl / 100.0)
                         total = sig["realized_pnl"] + unrealized
                         sig["pnl_usd"] = round(BET_SIZE_USD * total, 4)
-            except Exception as exc:
-                log.debug("Price update error for %s: %s", sig.get("symbol", "?"), exc)
+                except Exception as exc:
+                    log.debug("Price update error for %s: %s", sig.get("symbol", "?"), exc)
 
 
 async def listen_pumpportal():
@@ -774,6 +918,9 @@ async def listen_pumpportal():
                         "ml_confidence": None,
                         "price_snap_15s": 0.0,
                         "price_snap_30s": 0.0,
+                        "price_snap_60s": 0.0,
+                        "price_snap_120s": 0.0,
+                        "price_snap_1800s": 0.0,
                     }
 
                     trade_counts[mint] = {
@@ -842,10 +989,10 @@ async def listen_pumpportal():
                         token_age = time.time() - tokens[mint]["created_ts"]
                         cur_price = bonding_curve_price_usd(new_v_sol, new_v_tokens) if new_v_sol > 0 and new_v_tokens > 0 else 0
                         if cur_price > 0:
-                            if token_age >= 15 and tokens[mint]["price_snap_15s"] == 0.0:
-                                tokens[mint]["price_snap_15s"] = cur_price
-                            if token_age >= 30 and tokens[mint]["price_snap_30s"] == 0.0:
-                                tokens[mint]["price_snap_30s"] = cur_price
+                            for snap_s in (15, 30, 60, 120, 1800):
+                                key = f"price_snap_{snap_s}s"
+                                if token_age >= snap_s and tokens[mint].get(key, 0.0) == 0.0:
+                                    tokens[mint][key] = cur_price
 
                     for sig in signals:
                         if sig["mint"] == mint and sig["status"] == "ACTIVE":
@@ -1120,10 +1267,10 @@ def _update_model_file_info():
 
 
 def get_reward_weight(pnl: float) -> float:
+    if pnl >= 1000:
+        return 80.0
     if pnl >= 500:
         return 50.0
-    if pnl >= 400:
-        return 40.0
     if pnl >= 300:
         return 30.0
     if pnl >= 200:
@@ -1132,41 +1279,67 @@ def get_reward_weight(pnl: float) -> float:
         return 10.0
     if pnl >= 50:
         return 5.0
+    if pnl >= 30:
+        return 3.0
     if pnl >= 20:
-        return 3.0
-    if pnl >= 5:
         return 2.0
-    if pnl >= 0:
+    if pnl >= 10:
         return 1.5
+    if pnl >= 5:
+        return 1.2
+    if pnl >= 0:
+        return 1.0
     if pnl >= -5:
+        return 1.5
+    if pnl >= -10:
         return 2.0
-    if pnl >= -15:
+    if pnl >= -20:
         return 3.0
-    if pnl >= -80:
+    if pnl >= -30:
         return 4.0
+    if pnl >= -50:
+        return 6.0
+    if pnl >= -80:
+        return 10.0
     return 25.0
 
 
 def pnl_to_soft_label(pnl: float) -> float:
+    if pnl >= 1000:
+        return 0.99
     if pnl >= 500:
         return 0.98
+    if pnl >= 300:
+        return 0.96
     if pnl >= 200:
-        return 0.95
+        return 0.94
     if pnl >= 100:
         return 0.90
     if pnl >= 50:
         return 0.85
+    if pnl >= 30:
+        return 0.72
     if pnl >= 20:
-        return 0.75
+        return 0.45
+    if pnl >= 10:
+        return 0.35
     if pnl >= 5:
-        return 0.60
+        return 0.28
     if pnl >= 0:
-        return 0.30
+        return 0.20
     if pnl >= -5:
         return 0.15
+    if pnl >= -10:
+        return 0.12
     if pnl >= -20:
         return 0.10
-    return 0.05
+    if pnl >= -30:
+        return 0.08
+    if pnl >= -50:
+        return 0.06
+    if pnl >= -80:
+        return 0.04
+    return 0.02
 
 
 def cosine_lr(cycle: int) -> float:
@@ -1420,11 +1593,12 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         await asyncio.sleep(10)
         now = time.time()
         done_this_round = []
-        for mint in list(unchecked):
-            bt = batch_tokens[mint]
+        for key in list(unchecked):
+            bt = batch_tokens[key]
             age = now - bt["eval_ts"]
             if age < BATCH_DURATION:
                 continue
+            mint = bt.get("mint")
             token_data = tokens.get(mint)
             if token_data:
                 cur_v_sol = token_data.get("v_sol_in_bonding", 0)
@@ -1435,7 +1609,7 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
                 )
                 if hyp_pnl is not None:
                     soft_label = pnl_to_soft_label(hyp_pnl)
-                    hard_label = 1.0 if hyp_pnl >= 5.0 else 0.0
+                    hard_label = 1.0 if hyp_pnl >= 30.0 else 0.0
                     weight = get_reward_weight(hyp_pnl)
                     samples.append({
                         "features": bt["features"],
@@ -1456,14 +1630,14 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
                         correct_trash += 1
             done_this_round.append(mint)
 
-        for mint in done_this_round:
-            unchecked.discard(mint)
+        for key in done_this_round:
+            unchecked.discard(key)
             batch_state["checking_progress"] += 1
             batch_state["checking_samples"] = len(samples)
 
         if not unchecked:
             break
-        earliest = min((batch_tokens[m]["eval_ts"] for m in unchecked), default=now)
+        earliest = min((batch_tokens[k]["eval_ts"] for k in unchecked), default=now)
         if now - earliest > BATCH_DURATION + 300:
             batch_state["checking_progress"] += len(unchecked)
             unchecked.clear()

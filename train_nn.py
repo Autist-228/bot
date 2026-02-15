@@ -39,6 +39,19 @@ ENTRY_FEATURES = [
     "top5_holder_pct",
     "sniper_count",
     "num_holders",
+    "log_volume_sol",
+    "buy_sell_ratio",
+    "whale_buy_pct",
+    "dev_balance_pct",
+    "price_velocity_norm",
+    "log_net_sol_flow",
+    "momentum_0_15",
+    "large_buy_count",
+    "token_age_norm",
+    "bonding_curve_velocity",
+    "seller_buyer_overlap",
+    "sell_to_buy_sol_ratio",
+    "holder_net_pct",
 ]
 
 EXIT_POSITION_FEATURES = [
@@ -52,13 +65,13 @@ EXIT_POSITION_FEATURES = [
 COST_BUY = (1 - PUMPFUN_FEE_PCT) * (1 - BUY_SLIPPAGE_PCT)
 COST_SELL = (1 - PUMPFUN_FEE_PCT) * (1 - SELL_SLIPPAGE_PCT)
 
-ENTRY_AGE_MIN = 30
+ENTRY_AGE_MIN = 15
 ENTRY_AGE_MAX = 360
 MAX_HOLD_SEC = 900
-MAX_GAIN_PCT = 500.0
+MAX_GAIN_PCT = 10000.0
 SOL_PRICE_USD = 200.0
 
-PROFITABLE_THRESHOLD = 5.0
+PROFITABLE_THRESHOLD = 30.0
 EXIT_SAMPLE_INTERVAL = 5
 
 
@@ -67,7 +80,47 @@ BONDING_GRAD_SOL = 85.0
 
 
 class EntryNet(nn.Module):
-    def __init__(self, n_features=15):
+    def __init__(self, n_features=28):
+        super().__init__()
+        self.input_block = nn.Sequential(
+            nn.Linear(n_features, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+        )
+        self.hidden1 = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.25),
+        )
+        self.hidden2 = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+        )
+        self.hidden3 = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+        )
+        self.residual = nn.Linear(128, 32)
+        self.head = nn.Sequential(
+            nn.Linear(32, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        x = self.input_block(x)
+        h1 = self.hidden1(x)
+        h2 = self.hidden2(h1)
+        h3 = self.hidden3(h2)
+        res = self.residual(h1)
+        return self.head(h3 + res).squeeze(-1)
+
+
+class ExitNet(nn.Module):
+    def __init__(self, n_features=36):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, 128),
@@ -80,26 +133,6 @@ class EntryNet(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
-
-class ExitNet(nn.Module):
-    def __init__(self, n_features=20):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_features, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 32),
-            nn.LayerNorm(32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
             nn.Linear(32, 1),
             nn.Sigmoid(),
         )
@@ -167,12 +200,14 @@ def extract_entry_features(token, entry_ts):
     sniper_count = len(snipers)
 
     buyer_totals = {}
+    buyer_amounts = {}
     for t in pre_entry:
         tr = t.get("trader", "")
         if not tr:
             continue
         if t["type"] == "buy":
             buyer_totals[tr] = buyer_totals.get(tr, 0) + t.get("sol", 0)
+            buyer_amounts[tr] = buyer_amounts.get(tr, 0) + t.get("sol", 0)
         else:
             buyer_totals[tr] = buyer_totals.get(tr, 0) - t.get("sol", 0)
     positive = {k: v for k, v in buyer_totals.items() if v > 0}
@@ -184,6 +219,39 @@ def extract_entry_features(token, entry_ts):
         top5_pct = 100.0
     else:
         top5_pct = 0.0
+
+    whale_buy_pct = max_buy_sol / max(0.01, buy_sol) * 100
+
+    dev_addr = token.get("dev_address", "")
+    if not dev_addr and buys:
+        dev_addr = buys[0].get("trader", "")
+    dev_bought = sum(t.get("sol", 0) for t in buys if t.get("trader") == dev_addr) if dev_addr else 0
+    dev_sold = sum(t.get("sol", 0) for t in sells if t.get("trader") == dev_addr) if dev_addr else 0
+    dev_balance_pct = (dev_bought - dev_sold) / max(0.01, buy_sol) * 100
+    dev_balance_pct = max(-100.0, min(100.0, dev_balance_pct))
+
+    cur_prices = [t.get("price_sol", 0) for t in pre_entry if t.get("price_sol", 0) > 0]
+    cur_price = cur_prices[-1] if cur_prices else first_price
+    price_velocity_norm = 0.0
+    if first_price > 0 and cur_price > 0:
+        price_velocity_norm = ((cur_price / first_price) - 1) / age * 100
+        price_velocity_norm = max(-100.0, min(100.0, price_velocity_norm))
+
+    prices_0_15 = [t["price_sol"] for t in pre_entry if t.get("price_sol", 0) > 0 and (t["ts"] - created_ts) <= 15]
+    prices_15plus = [t["price_sol"] for t in pre_entry if t.get("price_sol", 0) > 0 and (t["ts"] - created_ts) > 15]
+    p_0_15 = np.median(prices_0_15) if prices_0_15 else 0
+    p_15plus = np.median(prices_15plus) if prices_15plus else p_0_15
+    momentum_0_15 = ((p_15plus / p_0_15) - 1) * 100 if p_0_15 > 0 and p_15plus > 0 else 0.0
+    momentum_0_15 = max(-500.0, min(500.0, momentum_0_15))
+
+    large_buy_count = float(sum(1 for amt in buyer_amounts.values() if amt >= 1.0))
+
+    buyer_set = set(t.get("trader", "") for t in buys if t.get("trader"))
+    seller_set = set(t.get("trader", "") for t in sells if t.get("trader"))
+    overlap = len(seller_set & buyer_set)
+    seller_buyer_overlap = overlap / max(1, len(seller_set)) if seller_set else 0.0
+
+    holder_net_pct = len(positive) / max(1, len(buyer_set)) * 100 if buyer_set else 0.0
 
     return {
         "log_buy_sol": np.log1p(first_buy_sol),
@@ -201,6 +269,19 @@ def extract_entry_features(token, entry_ts):
         "top5_holder_pct": top5_pct,
         "sniper_count": float(sniper_count),
         "num_holders": float(unique_buyers),
+        "log_volume_sol": np.log1p(buy_sol),
+        "buy_sell_ratio": n_buys / max(1, n_sells),
+        "whale_buy_pct": whale_buy_pct,
+        "dev_balance_pct": dev_balance_pct,
+        "price_velocity_norm": price_velocity_norm,
+        "log_net_sol_flow": np.log1p(max(0, net_sol_in)),
+        "momentum_0_15": momentum_0_15,
+        "large_buy_count": large_buy_count,
+        "token_age_norm": min(entry_age / 300.0, 1.0),
+        "bonding_curve_velocity": bonding_progress / age * 60,
+        "seller_buyer_overlap": seller_buyer_overlap,
+        "sell_to_buy_sol_ratio": sell_sol / max(0.01, buy_sol),
+        "holder_net_pct": holder_net_pct,
     }
 
 
