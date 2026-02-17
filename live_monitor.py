@@ -53,6 +53,8 @@ MIN_BUYS_FOR_SIGNAL = 5
 MAX_BUYS_FOR_SIGNAL = 999
 PRICE_POLL_INTERVAL = 0.5
 MAX_SELLS_PER_TOKEN = 1
+MAX_SIGNAL_AGE_NO_PRICE = 6 * 3600
+MAX_SIGNAL_AGE_HARD = 12 * 3600
 
 tokens: dict[str, dict] = {}
 trade_counts: dict[str, dict] = {}
@@ -814,6 +816,10 @@ async def signal_price_updater():
                             current_pnl = (COST_BUY * COST_SELL * (1 + gross / 100) - 1) * 100
 
                     if current_pnl is None:
+                        age = time.time() - sig["signal_time"]
+                        if age > MAX_SIGNAL_AGE_NO_PRICE:
+                            log.info("STALE %s: %dh without price, force closing", sig["symbol"], int(age / 3600))
+                            close_signal(sig, "STALE", 0.0)
                         continue
 
                     sig["pnl_pct"] = round(current_pnl, 1)
@@ -848,6 +854,13 @@ async def signal_price_updater():
                             sig["ns2_first_sell_pnl"] = round(current_pnl, 2)
                             log.info("NS2 SHADOW SELL %s at pnl=%+.1f%% (score=%.3f)",
                                      sig["symbol"], current_pnl, shadow)
+
+                    age = time.time() - sig["signal_time"]
+                    if age > MAX_SIGNAL_AGE_HARD:
+                        log.info("AGE_TIMEOUT %s: %dh active, closing at pnl=%+.1f%%", sig["symbol"], int(age / 3600), current_pnl)
+                        _record_shadow_trade(sig, current_pnl, "AGE_TIMEOUT")
+                        close_signal(sig, "AGE_TIMEOUT", current_pnl)
+                        continue
 
                     reason = check_exit_rules(sig, current_pnl)
                     if reason:
