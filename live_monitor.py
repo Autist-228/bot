@@ -101,7 +101,9 @@ DATASET_DIR = os.path.join(DATA_DIR, "training_data")
 SNAPSHOT_DIR = os.path.join(DATA_DIR, "token_snapshots")
 SIGNAL_LOG_DIR = os.path.join(DATA_DIR, "signal_logs")
 
-MULTI_EVAL_CHECKPOINTS = [15, 30, 60, 120, 1800]
+MULTI_EVAL_CHECKPOINTS = [15, 30, 60, 120, 240, 1800]
+LABEL_3H_DELAY = 10800
+pending_3h_queue: list[dict] = []
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 
 replay_buffer: deque = deque(maxlen=REPLAY_BUFFER_MAX_BATCHES)
@@ -524,11 +526,13 @@ async def ml_scanner(client: httpx.AsyncClient):
             mom_30 = _live_mom("price_snap_30s")
             mom_60 = _live_mom("price_snap_60s")
             mom_120 = _live_mom("price_snap_120s")
+            mom_240 = _live_mom("price_snap_240s")
             mom_1800 = _live_mom("price_snap_1800s")
             token["price_momentum_15s"] = mom_15
             token["price_momentum_30s"] = mom_30
             token["price_momentum_60s"] = mom_60
             token["price_momentum_120s"] = mom_120
+            token["price_momentum_240s"] = mom_240
             token["price_momentum_1800s"] = mom_1800
             token["price_accel_short"] = mom_30 - mom_15
             token["price_accel_long"] = mom_120 - mom_60
@@ -1033,6 +1037,7 @@ async def listen_pumpportal():
                         "price_snap_30s": 0.0,
                         "price_snap_60s": 0.0,
                         "price_snap_120s": 0.0,
+                        "price_snap_240s": 0.0,
                         "price_snap_1800s": 0.0,
                     }
 
@@ -1102,7 +1107,7 @@ async def listen_pumpportal():
                         token_age = time.time() - tokens[mint]["created_ts"]
                         cur_price = bonding_curve_price_usd(new_v_sol, new_v_tokens) if new_v_sol > 0 and new_v_tokens > 0 else 0
                         if cur_price > 0:
-                            for snap_s in (15, 30, 60, 120, 1800):
+                            for snap_s in (15, 30, 60, 120, 240, 1800):
                                 key = f"price_snap_{snap_s}s"
                                 if token_age >= snap_s and tokens[mint].get(key, 0.0) == 0.0:
                                     tokens[mint][key] = cur_price
@@ -2074,11 +2079,133 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
     batch_state["total_tokens_fed"] += fed_count
     batch_state["total_batches"] += 1
 
+    for key, bt in batch_tokens.items():
+        pending_3h_queue.append({
+            "mint": bt["mint"],
+            "features": bt["features"],
+            "entry_v_sol": bt["entry_v_sol"],
+            "entry_v_tokens": bt["entry_v_tokens"],
+            "entry_price_usd": bt.get("entry_price_usd", 0),
+            "eval_ts": bt["eval_ts"],
+        })
+    if len(pending_3h_queue) > 50000:
+        pending_3h_queue[:] = pending_3h_queue[-30000:]
+    log.info("3H QUEUE: %d tokens pending re-evaluation", len(pending_3h_queue))
+
     batch_state["checking_id"] = 0
     batch_state["checking_progress"] = 0
     batch_state["checking_total"] = 0
     batch_state["checking_samples"] = 0
     _save_batch_state()
+
+
+async def process_3h_labels(client: httpx.AsyncClient):
+    global entry_model, entry_mean, entry_std, entry_optimizer
+    now = time.time()
+    ready = [item for item in pending_3h_queue if now - item["eval_ts"] >= LABEL_3H_DELAY]
+    if not ready:
+        return
+
+    samples_3h = []
+    for item in ready:
+        mint = item["mint"]
+        entry_price = item["entry_price_usd"]
+        hyp_pnl = None
+
+        token_data = tokens.get(mint)
+        if token_data:
+            cur_v_sol = token_data.get("v_sol_in_bonding", 0)
+            cur_v_tokens = token_data.get("v_tokens_in_bonding", 0)
+            hyp_pnl = calc_token_pnl(
+                item["entry_v_sol"], item["entry_v_tokens"],
+                cur_v_sol, cur_v_tokens,
+            )
+        else:
+            try:
+                r = await client.get(
+                    f"{DEXSCREENER_API}/{mint}",
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    pairs = data if isinstance(data, list) else []
+                    if pairs:
+                        cur_price = float(pairs[0].get("priceUsd") or 0)
+                        if cur_price > 0 and entry_price > 0:
+                            hyp_pnl = ((cur_price / entry_price) - 1) * 100
+            except Exception:
+                pass
+
+        if hyp_pnl is not None:
+            soft_label = pnl_to_soft_label(hyp_pnl)
+            hard_label = 1.0 if hyp_pnl >= 30.0 else 0.0
+            weight = get_reward_weight(hyp_pnl) * 1.5
+            samples_3h.append({
+                "features": item["features"],
+                "label": soft_label,
+                "hard_label": hard_label,
+                "weight": weight,
+                "pnl": hyp_pnl,
+            })
+
+    for item in ready:
+        pending_3h_queue.remove(item)
+
+    if len(samples_3h) < 3 or entry_model is None:
+        if samples_3h:
+            log.info("3H LABEL: %d samples (need >=3), skipping", len(samples_3h))
+        return
+
+    X = np.array([s["features"] for s in samples_3h], dtype=np.float32)
+    y = np.array([s["label"] for s in samples_3h], dtype=np.float32)
+    w = np.array([s["weight"] for s in samples_3h], dtype=np.float32)
+
+    X_n = (X - entry_mean) / entry_std
+    X_t = torch.from_numpy(X_n)
+    y_t = torch.from_numpy(y)
+    w_t = torch.from_numpy(w)
+
+    entry_model.train()
+    final_loss = 0.0
+    for epoch in range(5):
+        entry_optimizer.zero_grad()
+        pred = entry_model(X_t)
+        bce = torch.nn.functional.binary_cross_entropy(pred, y_t, reduction="none")
+        pt = pred * y_t + (1 - pred) * (1 - y_t)
+        focal_weight = (1 - pt).pow(FOCAL_GAMMA)
+        loss = (w_t * focal_weight * bce).mean()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(entry_model.parameters(), 1.0)
+        entry_optimizer.step()
+        final_loss = loss.item()
+    entry_model.eval()
+
+    rockets_3h = sum(1 for s in samples_3h if s["hard_label"] > 0.5)
+    avg_pnl = np.mean([s["pnl"] for s in samples_3h])
+    log.info(
+        "3H LABEL UPDATE: %d samples | %d rockets | avg_pnl=%.1f%% | loss=%.4f",
+        len(samples_3h), rockets_3h, avg_pnl, final_loss,
+    )
+
+    entry_path = os.path.join(DATA_DIR, "entry_model.pt")
+    torch.save({
+        "model": entry_model.state_dict(),
+        "optimizer": entry_optimizer.state_dict(),
+        "n_features": len(FEATURES),
+        "mean": entry_mean.tolist(),
+        "std": entry_std.tolist(),
+        "model_info": dict(model_info),
+    }, entry_path)
+
+
+async def delayed_label_checker(client: httpx.AsyncClient):
+    while True:
+        await asyncio.sleep(600)
+        try:
+            if pending_3h_queue:
+                await process_3h_labels(client)
+        except Exception as e:
+            log_error(f"3H label error: {e}")
 
 
 async def batch_processor():
@@ -2316,6 +2443,7 @@ async def main():
         saver = asyncio.create_task(auto_saver())
         hourly_saver = asyncio.create_task(hourly_stats_saver())
         model_snapper = asyncio.create_task(model_snapshot_saver())
+        label_3h_task = asyncio.create_task(delayed_label_checker(client))
 
         if tg_bot:
             await tg_bot.start()
@@ -2349,6 +2477,7 @@ async def main():
         saver.cancel()
         hourly_saver.cancel()
         model_snapper.cancel()
+        label_3h_task.cancel()
 
         track_extra = 120
         await asyncio.sleep(track_extra)

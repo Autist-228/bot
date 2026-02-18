@@ -56,6 +56,7 @@ ENTRY_FEATURES = [
     "price_momentum_30s",
     "price_momentum_60s",
     "price_momentum_120s",
+    "price_momentum_240s",
     "price_momentum_1800s",
     "price_accel_short",
     "price_accel_long",
@@ -316,6 +317,7 @@ def extract_entry_features(token, entry_ts, checkpoint_sec=60):
     mom_30 = _mom(30)
     mom_60 = _mom(60)
     mom_120 = _mom(120)
+    mom_240 = _mom(240)
     mom_1800 = _mom(1800)
 
     cur_mcap_usd = cur_price * SOL_PRICE_USD * 1e9 if cur_price > 0 else 0
@@ -356,6 +358,7 @@ def extract_entry_features(token, entry_ts, checkpoint_sec=60):
         "price_momentum_30s": mom_30,
         "price_momentum_60s": mom_60,
         "price_momentum_120s": mom_120,
+        "price_momentum_240s": mom_240,
         "price_momentum_1800s": mom_1800,
         "price_accel_short": mom_30 - mom_15,
         "price_accel_long": mom_120 - mom_60,
