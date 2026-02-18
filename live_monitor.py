@@ -330,21 +330,56 @@ async def enrich_token(client: httpx.AsyncClient, mint: str):
         log_error(f"Enrich ошибка {mint[:8]}: {e}")
 
 
+RUGCHECK_API = "https://api.rugcheck.xyz/v1/tokens"
+
+
+async def rugcheck_token(client: httpx.AsyncClient, mint: str):
+    try:
+        r = await client.get(
+            f"{RUGCHECK_API}/{mint}/report",
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return
+        data = r.json()
+        token = tokens.get(mint)
+        if not token:
+            return
+        score_norm = (data.get("score_normalised") or 0) / 100.0
+        token["rugcheck_score_norm"] = min(score_norm, 1.0)
+        token["rugcheck_insiders"] = float(data.get("graphInsidersDetected") or 0)
+        risks = data.get("risks") or []
+        token["rugcheck_risk_count"] = float(len(risks))
+        token["rugcheck_has_danger"] = 1.0 if any(r.get("level") == "danger" for r in risks) else 0.0
+        creator_tokens = data.get("creatorTokens") or []
+        token["rugcheck_creator_tokens"] = float(min(len(creator_tokens), 50))
+        token["rugcheck_done"] = True
+    except Exception as e:
+        log_error(f"RugCheck ошибка {mint[:8]}: {e}")
+
+
 async def enrich_batch(client: httpx.AsyncClient):
     while True:
         await asyncio.sleep(15)
         now = time.time()
         to_enrich = []
+        to_rugcheck = []
         for mint, token in list(tokens.items()):
             age = now - token["created_ts"]
             if age >= 60 and not token.get("enriched") and not token.get("enrich_tried"):
                 to_enrich.append(mint)
+            if age >= 30 and not token.get("rugcheck_done") and not token.get("rugcheck_tried"):
+                to_rugcheck.append(mint)
             if len(to_enrich) >= 5:
                 break
         for mint in to_enrich:
             tokens[mint]["enrich_tried"] = True
             await enrich_token(client, mint)
             await asyncio.sleep(1.1)
+        for mint in to_rugcheck[:3]:
+            tokens[mint]["rugcheck_tried"] = True
+            await rugcheck_token(client, mint)
+            await asyncio.sleep(0.5)
 
 
 def calc_bonding_curve_pnl(sig: dict, token_data: dict) -> float | None:
@@ -478,6 +513,64 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["seller_buyer_overlap"] = overlap / max(1, len(unique_sellers_set)) if unique_sellers_set else 0.0
             token["sell_to_buy_sol_ratio"] = sell_sol_total / max(0.01, buy_sol_total)
             token["holder_net_pct"] = len(positive) / max(1, len(unique_buyers_set)) * 100 if unique_buyers_set else 0.0
+
+            init_p_usd2 = token.get("initial_price_usd", 0)
+            def _live_mom(snap_key):
+                p = token.get(snap_key, 0)
+                if p and init_p_usd2 > 0:
+                    return max(-500.0, min(500.0, ((p / init_p_usd2) - 1) * 100))
+                return 0.0
+            mom_15 = _live_mom("price_snap_15s")
+            mom_30 = _live_mom("price_snap_30s")
+            mom_60 = _live_mom("price_snap_60s")
+            mom_120 = _live_mom("price_snap_120s")
+            mom_1800 = _live_mom("price_snap_1800s")
+            token["price_momentum_15s"] = mom_15
+            token["price_momentum_30s"] = mom_30
+            token["price_momentum_60s"] = mom_60
+            token["price_momentum_120s"] = mom_120
+            token["price_momentum_1800s"] = mom_1800
+            token["price_accel_short"] = mom_30 - mom_15
+            token["price_accel_long"] = mom_120 - mom_60
+
+            token["log_dex_liquidity"] = np.log1p(token.get("dex_liquidity_usd", 0) or 0)
+            token["log_dex_volume_5m"] = np.log1p(token.get("dex_volume_5m", 0) or 0)
+            token["log_dex_volume_1h"] = np.log1p(token.get("dex_volume_1h", 0) or 0)
+            token["dex_buy_sell_5m"] = (token.get("dex_buys_5m", 0) or 0) / max(1, token.get("dex_sells_5m", 0) or 1)
+            token["dex_buy_sell_1h"] = (token.get("dex_buys_1h", 0) or 0) / max(1, token.get("dex_sells_1h", 0) or 1)
+            token["log_dex_market_cap"] = np.log1p(token.get("dex_market_cap", 0) or 0)
+            token["log_dex_fdv"] = np.log1p(token.get("dex_fdv", 0) or 0)
+            token["has_socials"] = 1.0 if token.get("has_socials") else 0.0
+            token["has_website"] = 1.0 if token.get("has_website") else 0.0
+            token["is_migrated"] = 1.0 if token.get("migrated") else 0.0
+            token["is_enriched"] = 1.0 if token.get("enriched") else 0.0
+
+            token["rugcheck_score_norm"] = min(token.get("rugcheck_score_norm", 0) or 0, 1.0)
+            token["rugcheck_insiders"] = float(token.get("rugcheck_insiders", 0) or 0)
+            token["rugcheck_risk_count"] = float(token.get("rugcheck_risk_count", 0) or 0)
+            token["rugcheck_has_danger"] = 1.0 if token.get("rugcheck_has_danger") else 0.0
+            token["rugcheck_creator_tokens"] = float(min(token.get("rugcheck_creator_tokens", 0) or 0, 50))
+
+            token_name = token.get("name", "") or ""
+            token_symbol = token.get("symbol", "") or ""
+            token["name_length_norm"] = min(len(token_name), 50) / 50.0
+            token["symbol_length_norm"] = min(len(token_symbol), 10) / 10.0
+            token["name_has_numbers"] = 1.0 if any(c.isdigit() for c in token_name) else 0.0
+
+            sniper_cnt = float(len(tc.get("early_buyers", set())))
+            token["early_buyer_pct"] = sniper_cnt / max(1, len(unique_buyers_set)) * 100
+            token["log_sell_sol"] = np.log1p(sell_sol_total)
+            token["log_buy_sol_per_buyer"] = np.log1p(buy_sol_total / max(1, len(unique_buyers_set)))
+            token["holder_ratio"] = (len(unique_buyers_set) - len(unique_sellers_set)) / max(1, len(unique_buyers_set)) * 100
+            dev_sold_sol = seller_amts.get(dev_addr, 0) if dev_addr else 0
+            token["dev_sold"] = 1.0 if dev_sold_sol > 0 else 0.0
+            token["trade_intensity"] = total_trades / max(1, age)
+            token["sol_price_context"] = SOL_PRICE_USD / 200.0
+            initial_mcap = token.get("initial_mcap_usd", 0)
+            cur_mcap_usd = cur_price * 1_000_000_000 / max(1, v_tokens) if v_tokens > 0 else 0
+            token["mcap_growth"] = max(-500.0, min(500.0, ((cur_mcap_usd / max(1, initial_mcap)) - 1) * 100 if initial_mcap > 0 else 0.0))
+            token["dex_volume_mcap_ratio"] = (token.get("dex_volume_1h", 0) or 0) / max(1.0, token.get("dex_market_cap", 0) or 1.0)
+            token["checkpoint_norm"] = checkpoint_hit / 1800.0
 
             label, confidence = predict_token(token)
             token.setdefault("ml_checkpoints_done", []).append(checkpoint_hit)
@@ -1717,6 +1810,23 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         y = np.array([s["label"] for s in all_samples], dtype=np.float32)
         w = np.array([s["weight"] for s in all_samples], dtype=np.float32)
         h = np.array([s["hard_label"] for s in all_samples], dtype=np.float32)
+
+        X_raw = np.array([s["features"] for s in samples], dtype=np.float32)
+        zero_features = []
+        for fi, fname in enumerate(FEATURES):
+            if fi < X_raw.shape[1] and np.all(X_raw[:, fi] == 0):
+                zero_features.append(fname)
+        if zero_features:
+            log.warning("FEATURE AUDIT batch #%d: %d features always 0: %s", batch_id, len(zero_features), ", ".join(zero_features[:10]))
+        else:
+            log.info("FEATURE AUDIT batch #%d: all %d features have non-zero values", batch_id, len(FEATURES))
+
+        EMA_ALPHA = 0.1
+        batch_mean = X_raw.mean(axis=0)
+        batch_std = X_raw.std(axis=0)
+        batch_std[batch_std < 1e-6] = 1.0
+        entry_mean = (1 - EMA_ALPHA) * entry_mean + EMA_ALPHA * batch_mean
+        entry_std = (1 - EMA_ALPHA) * entry_std + EMA_ALPHA * batch_std
 
         rocket_mask = h > 0.5
         trash_mask = ~rocket_mask

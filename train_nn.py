@@ -52,6 +52,42 @@ ENTRY_FEATURES = [
     "seller_buyer_overlap",
     "sell_to_buy_sol_ratio",
     "holder_net_pct",
+    "price_momentum_15s",
+    "price_momentum_30s",
+    "price_momentum_60s",
+    "price_momentum_120s",
+    "price_momentum_1800s",
+    "price_accel_short",
+    "price_accel_long",
+    "log_dex_liquidity",
+    "log_dex_volume_5m",
+    "log_dex_volume_1h",
+    "dex_buy_sell_5m",
+    "dex_buy_sell_1h",
+    "log_dex_market_cap",
+    "log_dex_fdv",
+    "has_socials",
+    "has_website",
+    "is_migrated",
+    "is_enriched",
+    "rugcheck_score_norm",
+    "rugcheck_insiders",
+    "rugcheck_risk_count",
+    "rugcheck_has_danger",
+    "rugcheck_creator_tokens",
+    "name_length_norm",
+    "symbol_length_norm",
+    "name_has_numbers",
+    "early_buyer_pct",
+    "log_sell_sol",
+    "log_buy_sol_per_buyer",
+    "holder_ratio",
+    "dev_sold",
+    "trade_intensity",
+    "sol_price_context",
+    "mcap_growth",
+    "dex_volume_mcap_ratio",
+    "checkpoint_norm",
 ]
 
 EXIT_POSITION_FEATURES = [
@@ -149,7 +185,21 @@ def calc_gain(entry_price, current_price):
     return float(np.clip(gain, -100.0, MAX_GAIN_PCT))
 
 
-def extract_entry_features(token, entry_ts):
+def _get_price_at_age(trades, created_ts, target_age):
+    target_ts = created_ts + target_age
+    best = None
+    best_diff = float("inf")
+    for t in trades:
+        if t.get("price_sol", 0) <= 0:
+            continue
+        diff = abs(t["ts"] - target_ts)
+        if diff < best_diff and t["ts"] <= target_ts + 5:
+            best_diff = diff
+            best = t["price_sol"]
+    return best
+
+
+def extract_entry_features(token, entry_ts, checkpoint_sec=60):
     trades = token.get("trades", [])
     created_ts = token.get("created_ts", 0)
     if not created_ts and trades:
@@ -201,6 +251,7 @@ def extract_entry_features(token, entry_ts):
 
     buyer_totals = {}
     buyer_amounts = {}
+    seller_amounts = {}
     for t in pre_entry:
         tr = t.get("trader", "")
         if not tr:
@@ -210,6 +261,7 @@ def extract_entry_features(token, entry_ts):
             buyer_amounts[tr] = buyer_amounts.get(tr, 0) + t.get("sol", 0)
         else:
             buyer_totals[tr] = buyer_totals.get(tr, 0) - t.get("sol", 0)
+            seller_amounts[tr] = seller_amounts.get(tr, 0) + t.get("sol", 0)
     positive = {k: v for k, v in buyer_totals.items() if v > 0}
     total_pos = sum(positive.values())
     if total_pos > 0 and len(positive) >= 5:
@@ -226,8 +278,8 @@ def extract_entry_features(token, entry_ts):
     if not dev_addr and buys:
         dev_addr = buys[0].get("trader", "")
     dev_bought = sum(t.get("sol", 0) for t in buys if t.get("trader") == dev_addr) if dev_addr else 0
-    dev_sold = sum(t.get("sol", 0) for t in sells if t.get("trader") == dev_addr) if dev_addr else 0
-    dev_balance_pct = (dev_bought - dev_sold) / max(0.01, buy_sol) * 100
+    dev_sold_sol = sum(t.get("sol", 0) for t in sells if t.get("trader") == dev_addr) if dev_addr else 0
+    dev_balance_pct = (dev_bought - dev_sold_sol) / max(0.01, buy_sol) * 100
     dev_balance_pct = max(-100.0, min(100.0, dev_balance_pct))
 
     cur_prices = [t.get("price_sol", 0) for t in pre_entry if t.get("price_sol", 0) > 0]
@@ -252,6 +304,24 @@ def extract_entry_features(token, entry_ts):
     seller_buyer_overlap = overlap / max(1, len(seller_set)) if seller_set else 0.0
 
     holder_net_pct = len(positive) / max(1, len(buyer_set)) * 100 if buyer_set else 0.0
+
+    all_trades = token.get("trades", [])
+    def _mom(target_s):
+        p = _get_price_at_age(all_trades, created_ts, target_s)
+        if p and first_price > 0:
+            return max(-500.0, min(500.0, ((p / first_price) - 1) * 100))
+        return 0.0
+
+    mom_15 = _mom(15)
+    mom_30 = _mom(30)
+    mom_60 = _mom(60)
+    mom_120 = _mom(120)
+    mom_1800 = _mom(1800)
+
+    cur_mcap_usd = cur_price * SOL_PRICE_USD * 1e9 if cur_price > 0 else 0
+
+    token_name = token.get("name", "") or ""
+    token_symbol = token.get("symbol", "") or ""
 
     return {
         "log_buy_sol": np.log1p(first_buy_sol),
@@ -282,6 +352,42 @@ def extract_entry_features(token, entry_ts):
         "seller_buyer_overlap": seller_buyer_overlap,
         "sell_to_buy_sol_ratio": sell_sol / max(0.01, buy_sol),
         "holder_net_pct": holder_net_pct,
+        "price_momentum_15s": mom_15,
+        "price_momentum_30s": mom_30,
+        "price_momentum_60s": mom_60,
+        "price_momentum_120s": mom_120,
+        "price_momentum_1800s": mom_1800,
+        "price_accel_short": mom_30 - mom_15,
+        "price_accel_long": mom_120 - mom_60,
+        "log_dex_liquidity": np.log1p(token.get("dex_liquidity_usd", 0) or 0),
+        "log_dex_volume_5m": np.log1p(token.get("dex_volume_5m", 0) or 0),
+        "log_dex_volume_1h": np.log1p(token.get("dex_volume_1h", 0) or 0),
+        "dex_buy_sell_5m": (token.get("dex_buys_5m", 0) or 0) / max(1, token.get("dex_sells_5m", 0) or 1),
+        "dex_buy_sell_1h": (token.get("dex_buys_1h", 0) or 0) / max(1, token.get("dex_sells_1h", 0) or 1),
+        "log_dex_market_cap": np.log1p(token.get("dex_market_cap", 0) or 0),
+        "log_dex_fdv": np.log1p(token.get("dex_fdv", 0) or 0),
+        "has_socials": 1.0 if token.get("has_socials") else 0.0,
+        "has_website": 1.0 if token.get("has_website") else 0.0,
+        "is_migrated": 1.0 if token.get("migrated") else 0.0,
+        "is_enriched": 1.0 if token.get("enriched") else 0.0,
+        "rugcheck_score_norm": min((token.get("rugcheck_score_norm", 0) or 0), 1.0),
+        "rugcheck_insiders": float(token.get("rugcheck_insiders", 0) or 0),
+        "rugcheck_risk_count": float(token.get("rugcheck_risk_count", 0) or 0),
+        "rugcheck_has_danger": 1.0 if token.get("rugcheck_has_danger") else 0.0,
+        "rugcheck_creator_tokens": float(min(token.get("rugcheck_creator_tokens", 0) or 0, 50)),
+        "name_length_norm": min(len(token_name), 50) / 50.0,
+        "symbol_length_norm": min(len(token_symbol), 10) / 10.0,
+        "name_has_numbers": 1.0 if any(c.isdigit() for c in token_name) else 0.0,
+        "early_buyer_pct": sniper_count / max(1, unique_buyers) * 100,
+        "log_sell_sol": np.log1p(sell_sol),
+        "log_buy_sol_per_buyer": np.log1p(buy_sol / max(1, unique_buyers)),
+        "holder_ratio": (unique_buyers - len(seller_set)) / max(1, unique_buyers) * 100,
+        "dev_sold": 1.0 if dev_sold_sol > 0 else 0.0,
+        "trade_intensity": total / age,
+        "sol_price_context": SOL_PRICE_USD / 200.0,
+        "mcap_growth": max(-500.0, min(500.0, ((cur_mcap_usd / max(1, initial_mcap)) - 1) * 100 if initial_mcap > 0 else 0.0)),
+        "dex_volume_mcap_ratio": (token.get("dex_volume_1h", 0) or 0) / max(1.0, token.get("dex_market_cap", 0) or 1.0),
+        "checkpoint_norm": checkpoint_sec / 1800.0,
     }
 
 
