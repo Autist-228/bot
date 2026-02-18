@@ -10,7 +10,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 from telegram.constants import ParseMode
 
@@ -794,16 +796,25 @@ class SniperTelegramBot:
             return message_id
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = self._build_main_text()
-        kb = self._build_main_keyboard()
-        msg = await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        self.main_message_id = msg.message_id
+        log.info("TG CMD /start from chat_id=%s", update.effective_chat.id)
+        try:
+            text = self._build_main_text()
+            kb = self._build_main_keyboard()
+            msg = await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            self.main_message_id = msg.message_id
+            log.info("TG /start reply sent, msg_id=%s", msg.message_id)
+        except Exception as exc:
+            log.error("TG /start error: %s", exc, exc_info=True)
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = self._build_main_text()
-        kb = self._build_main_keyboard()
-        msg = await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        self.main_message_id = msg.message_id
+        log.info("TG CMD /status from chat_id=%s", update.effective_chat.id)
+        try:
+            text = self._build_main_text()
+            kb = self._build_main_keyboard()
+            msg = await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            self.main_message_id = msg.message_id
+        except Exception as exc:
+            log.error("TG /status error: %s", exc, exc_info=True)
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -962,13 +973,38 @@ class SniperTelegramBot:
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CommandHandler("status", self.cmd_status))
         self.app.add_handler(CallbackQueryHandler(self.button_handler))
+        self.app.add_handler(MessageHandler(filters.ALL, self._catch_all_handler))
+        self.app.add_error_handler(self._error_handler)
 
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling(drop_pending_updates=True)
+        await self.app.updater.start_polling(drop_pending_updates=False)
+
+        if self.chat_id:
+            try:
+                text = self._build_main_text()
+                kb = self._build_main_keyboard()
+                msg = await self.app.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                )
+                self.main_message_id = msg.message_id
+                self._current_screen = "main"
+                log.info("TG auto-sent main screen on startup, msg_id=%s", msg.message_id)
+            except Exception as exc:
+                log.warning("TG auto-send failed: %s", exc)
 
         self._update_task = asyncio.create_task(self._auto_update_loop())
         log.info("Telegram bot started (chat_id=%s)", self.chat_id)
+
+    async def _catch_all_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.message:
+            log.info("TG CATCH-ALL: chat_id=%s text=%r", update.effective_chat.id, update.message.text)
+
+    async def _error_handler(self, update, context: ContextTypes.DEFAULT_TYPE):
+        log.error("TG unhandled error: %s", context.error, exc_info=context.error)
 
     async def stop(self):
         if self._update_task:
