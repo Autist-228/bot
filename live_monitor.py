@@ -567,7 +567,7 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["trade_intensity"] = total_trades / max(1, age)
             token["sol_price_context"] = SOL_PRICE_USD / 200.0
             initial_mcap = token.get("initial_mcap_usd", 0)
-            cur_mcap_usd = cur_price * 1_000_000_000 / max(1, v_tokens) if v_tokens > 0 else 0
+            cur_mcap_usd = cur_price * SOL_PRICE_USD * 1e9 if cur_price > 0 else 0
             token["mcap_growth"] = max(-500.0, min(500.0, ((cur_mcap_usd / max(1, initial_mcap)) - 1) * 100 if initial_mcap > 0 else 0.0))
             token["dex_volume_mcap_ratio"] = (token.get("dex_volume_1h", 0) or 0) / max(1.0, token.get("dex_market_cap", 0) or 1.0)
             token["checkpoint_norm"] = checkpoint_hit / 1800.0
@@ -1687,7 +1687,7 @@ def generate_live_exit_samples(sig: dict) -> tuple[list, list, list]:
 
 
 async def _process_batch(batch_id: int, batch_tokens: dict):
-    global entry_model, exit_model, exit_mean, exit_std
+    global entry_model, exit_model, entry_mean, entry_std, exit_mean, exit_std
     global entry_optimizer, exit_optimizer
     total = len(batch_tokens)
     batch_state["checking_id"] = batch_id

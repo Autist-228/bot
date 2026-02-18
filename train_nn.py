@@ -383,7 +383,7 @@ def extract_entry_features(token, entry_ts, checkpoint_sec=60):
         "log_buy_sol_per_buyer": np.log1p(buy_sol / max(1, unique_buyers)),
         "holder_ratio": (unique_buyers - len(seller_set)) / max(1, unique_buyers) * 100,
         "dev_sold": 1.0 if dev_sold_sol > 0 else 0.0,
-        "trade_intensity": total / age,
+        "trade_intensity": total / max(1, age),
         "sol_price_context": SOL_PRICE_USD / 200.0,
         "mcap_growth": max(-500.0, min(500.0, ((cur_mcap_usd / max(1, initial_mcap)) - 1) * 100 if initial_mcap > 0 else 0.0)),
         "dex_volume_mcap_ratio": (token.get("dex_volume_1h", 0) or 0) / max(1.0, token.get("dex_market_cap", 0) or 1.0),
