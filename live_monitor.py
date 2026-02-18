@@ -132,6 +132,19 @@ shadow_stats: dict = {
     "trades": [],
 }
 
+label_3h_state: dict = {
+    "pending_count": 0,
+    "earliest_ready_ts": 0,
+    "last_samples": 0,
+    "last_rockets": 0,
+    "last_avg_pnl": 0.0,
+    "last_loss": 0.0,
+    "last_dex": 0,
+    "last_bonding": 0,
+    "last_failed": 0,
+    "last_check_ts": 0,
+}
+
 telegram_state: dict = {
     "signals": signals,
     "tokens": tokens,
@@ -145,6 +158,7 @@ telegram_state: dict = {
     "learner_running": False,
     "exit_model_info": exit_model_info,
     "shadow_stats": shadow_stats,
+    "label_3h_state": label_3h_state,
 }
 
 
@@ -2088,6 +2102,9 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         })
     if len(pending_3h_queue) > 50000:
         pending_3h_queue[:] = pending_3h_queue[-30000:]
+    label_3h_state["pending_count"] = len(pending_3h_queue)
+    if pending_3h_queue:
+        label_3h_state["earliest_ready_ts"] = min(item["eval_ts"] for item in pending_3h_queue) + LABEL_3H_DELAY
     log.info("3H QUEUE: %d tokens pending re-evaluation", len(pending_3h_queue))
 
     batch_state["checking_id"] = 0
@@ -2187,6 +2204,18 @@ async def process_3h_labels(client: httpx.AsyncClient):
         len(samples_3h), migrated_count, bonding_count, failed_count,
         rockets_3h, avg_pnl, final_loss,
     )
+
+    label_3h_state["last_samples"] = len(samples_3h)
+    label_3h_state["last_rockets"] = rockets_3h
+    label_3h_state["last_avg_pnl"] = float(avg_pnl)
+    label_3h_state["last_loss"] = final_loss
+    label_3h_state["last_dex"] = migrated_count
+    label_3h_state["last_bonding"] = bonding_count
+    label_3h_state["last_failed"] = failed_count
+    label_3h_state["last_check_ts"] = time.time()
+    label_3h_state["pending_count"] = len(pending_3h_queue)
+    if pending_3h_queue:
+        label_3h_state["earliest_ready_ts"] = min(item["eval_ts"] for item in pending_3h_queue) + LABEL_3H_DELAY
 
     entry_path = os.path.join(DATA_DIR, "entry_model.pt")
     torch.save({

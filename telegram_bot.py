@@ -175,10 +175,46 @@ class SniperTelegramBot:
             f"\U0001f4c9 Loss: {loss:.4f} | Acc: {last_acc:.1f}%" if loss > 0 else "\U0001f4c9 Loss: --- | Acc: ---",
         ]
 
+        lines.append(f"\u23f3 Сбор #{cur_id}: {cur_count} ток ({batch_mins}:{batch_secs:02d} / 30:00, {batch_pct}%)")
+
         if check_id > 0:
             check_pct = int(check_prog / max(1, check_total) * 100)
-            lines.append(f"\U0001f50d Проверка #{check_id}: {check_prog}/{check_total} ({check_pct}%) | {check_samples} годных")
-        lines.append(f"\u23f3 Сбор #{cur_id}: {cur_count} ток ({batch_mins}:{batch_secs:02d} / 30:00, {batch_pct}%)")
+            lines.append(f"\U0001f50d Проверка 30м #{check_id}: {check_prog}/{check_total} ({check_pct}%) | {check_samples} годных")
+        else:
+            batch_end_ts = cur_start + 1800 if cur_start > 0 else 0
+            check_remain = max(0, int(batch_end_ts - time.time()))
+            if check_remain > 0:
+                cr_m, cr_s = check_remain // 60, check_remain % 60
+                lines.append(f"\U0001f50d Проверка 30м: через {cr_m}:{cr_s:02d}")
+            else:
+                lines.append(f"\U0001f50d Проверка 30м: ожидание...")
+
+        l3h = self.state.get("label_3h_state", {})
+        l3h_pending = l3h.get("pending_count", 0)
+        l3h_earliest = l3h.get("earliest_ready_ts", 0)
+        l3h_last_ts = l3h.get("last_check_ts", 0)
+        if l3h_last_ts > 0:
+            l3h_s = l3h.get("last_samples", 0)
+            l3h_r = l3h.get("last_rockets", 0)
+            l3h_pnl = l3h.get("last_avg_pnl", 0)
+            l3h_loss = l3h.get("last_loss", 0)
+            l3h_dex = l3h.get("last_dex", 0)
+            l3h_bond = l3h.get("last_bonding", 0)
+            l3h_fail = l3h.get("last_failed", 0)
+            lines.append(
+                f"\U0001f552 Проверка 3ч: {l3h_s} выб ({l3h_dex}d/{l3h_bond}b/{l3h_fail}f) | "
+                f"{l3h_r} rak | pnl={l3h_pnl:+.1f}% | loss={l3h_loss:.4f}"
+            )
+            if l3h_pending > 0 and l3h_earliest > 0:
+                remain_3h = max(0, int(l3h_earliest - time.time()))
+                rh, rm = remain_3h // 3600, (remain_3h % 3600) // 60
+                lines.append(f"   \u23f3 В очереди: {l3h_pending} ток | след. через {rh}ч{rm:02d}м")
+        elif l3h_pending > 0 and l3h_earliest > 0:
+            remain_3h = max(0, int(l3h_earliest - time.time()))
+            rh, rm = remain_3h // 3600, (remain_3h % 3600) // 60
+            lines.append(f"\U0001f552 Проверка 3ч: {l3h_pending} ток в очереди | через {rh}ч{rm:02d}м")
+        else:
+            lines.append(f"\U0001f552 Проверка 3ч: нет токенов")
 
         exit_info = self.state.get("exit_model_info", {})
         ex_cycles = exit_info.get("cycles", 0)
