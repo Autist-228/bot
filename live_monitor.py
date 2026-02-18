@@ -526,13 +526,11 @@ async def ml_scanner(client: httpx.AsyncClient):
             mom_30 = _live_mom("price_snap_30s")
             mom_60 = _live_mom("price_snap_60s")
             mom_120 = _live_mom("price_snap_120s")
-            mom_240 = _live_mom("price_snap_240s")
             mom_1800 = _live_mom("price_snap_1800s")
             token["price_momentum_15s"] = mom_15
             token["price_momentum_30s"] = mom_30
             token["price_momentum_60s"] = mom_60
             token["price_momentum_120s"] = mom_120
-            token["price_momentum_240s"] = mom_240
             token["price_momentum_1800s"] = mom_1800
             token["price_accel_short"] = mom_30 - mom_15
             token["price_accel_long"] = mom_120 - mom_60
@@ -2107,33 +2105,34 @@ async def process_3h_labels(client: httpx.AsyncClient):
         return
 
     samples_3h = []
+    migrated_count = 0
+    bonding_count = 0
+    failed_count = 0
     for item in ready:
         mint = item["mint"]
         entry_price = item["entry_price_usd"]
         hyp_pnl = None
+        source = "unknown"
 
         token_data = tokens.get(mint)
-        if token_data:
+        if token_data and not token_data.get("migrated"):
             cur_v_sol = token_data.get("v_sol_in_bonding", 0)
             cur_v_tokens = token_data.get("v_tokens_in_bonding", 0)
             hyp_pnl = calc_token_pnl(
                 item["entry_v_sol"], item["entry_v_tokens"],
                 cur_v_sol, cur_v_tokens,
             )
-        else:
-            try:
-                r = await client.get(
-                    f"{DEXSCREENER_API}/tokens/v1/solana/{mint}",
-                    timeout=10,
-                )
-                if r.status_code == 200:
-                    pairs = r.json()
-                    if isinstance(pairs, list) and pairs:
-                        cur_price = float(pairs[0].get("priceUsd") or 0)
-                        if cur_price > 0 and entry_price > 0:
-                            hyp_pnl = ((cur_price / entry_price) - 1) * 100
-            except Exception:
-                pass
+            source = "bonding"
+            bonding_count += 1
+
+        if hyp_pnl is None:
+            dex_price = await _get_post_migration_price_usd(client, mint)
+            if dex_price and dex_price > 0 and entry_price > 0:
+                hyp_pnl = ((dex_price / entry_price) - 1) * 100
+                source = "dex"
+                migrated_count += 1
+            else:
+                failed_count += 1
 
         if hyp_pnl is not None:
             soft_label = pnl_to_soft_label(hyp_pnl)
@@ -2145,6 +2144,7 @@ async def process_3h_labels(client: httpx.AsyncClient):
                 "hard_label": hard_label,
                 "weight": weight,
                 "pnl": hyp_pnl,
+                "source": source,
             })
 
     for item in ready:
@@ -2181,9 +2181,11 @@ async def process_3h_labels(client: httpx.AsyncClient):
 
     rockets_3h = sum(1 for s in samples_3h if s["hard_label"] > 0.5)
     avg_pnl = np.mean([s["pnl"] for s in samples_3h])
+    dex_samples = sum(1 for s in samples_3h if s.get("source") == "dex")
     log.info(
-        "3H LABEL UPDATE: %d samples | %d rockets | avg_pnl=%.1f%% | loss=%.4f",
-        len(samples_3h), rockets_3h, avg_pnl, final_loss,
+        "3H LABEL UPDATE: %d samples (%d dex, %d bonding, %d failed) | %d rockets | avg_pnl=%.1f%% | loss=%.4f",
+        len(samples_3h), migrated_count, bonding_count, failed_count,
+        rockets_3h, avg_pnl, final_loss,
     )
 
     entry_path = os.path.join(DATA_DIR, "entry_model.pt")
