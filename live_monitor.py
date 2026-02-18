@@ -2123,13 +2123,12 @@ async def process_3h_labels(client: httpx.AsyncClient):
         else:
             try:
                 r = await client.get(
-                    f"{DEXSCREENER_API}/{mint}",
+                    f"{DEXSCREENER_API}/tokens/v1/solana/{mint}",
                     timeout=10,
                 )
                 if r.status_code == 200:
-                    data = r.json()
-                    pairs = data if isinstance(data, list) else []
-                    if pairs:
+                    pairs = r.json()
+                    if isinstance(pairs, list) and pairs:
                         cur_price = float(pairs[0].get("priceUsd") or 0)
                         if cur_price > 0 and entry_price > 0:
                             hyp_pnl = ((cur_price / entry_price) - 1) * 100
