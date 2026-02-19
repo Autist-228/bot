@@ -92,7 +92,7 @@ INITIAL_LR = 1e-4
 MIN_LR = 1e-5
 LR_CYCLE_BATCHES = 500
 FOCAL_GAMMA = 2.0
-AUGMENT_COPIES = 3
+AUGMENT_COPIES = 5
 AUGMENT_NOISE_STD = 0.05
 MINI_BATCH_SIZE = 64
 MAX_EPOCHS = 20
@@ -102,12 +102,13 @@ SNAPSHOT_DIR = os.path.join(DATA_DIR, "token_snapshots")
 SIGNAL_LOG_DIR = os.path.join(DATA_DIR, "signal_logs")
 
 MULTI_EVAL_CHECKPOINTS = [15, 30, 60, 120, 240, 1800]
-LABEL_3H_DELAY = 10800
+LABEL_3H_DELAY = 3600
 pending_3h_queue: list[dict] = []
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 
 replay_buffer: deque = deque(maxlen=REPLAY_BUFFER_MAX_BATCHES)
 exit_replay_buffer: deque = deque(maxlen=REPLAY_BUFFER_MAX_BATCHES)
+_processing_mints: set = set()
 entry_optimizer = None
 exit_optimizer = None
 
@@ -376,7 +377,7 @@ async def rugcheck_token(client: httpx.AsyncClient, mint: str):
 
 async def enrich_batch(client: httpx.AsyncClient):
     while True:
-        await asyncio.sleep(15)
+        await asyncio.sleep(10)
         now = time.time()
         to_enrich = []
         to_rugcheck = []
@@ -386,16 +387,16 @@ async def enrich_batch(client: httpx.AsyncClient):
                 to_enrich.append(mint)
             if age >= 30 and not token.get("rugcheck_done") and not token.get("rugcheck_tried"):
                 to_rugcheck.append(mint)
-            if len(to_enrich) >= 5:
+            if len(to_enrich) >= 15 and len(to_rugcheck) >= 10:
                 break
-        for mint in to_enrich:
+        for mint in to_enrich[:15]:
             tokens[mint]["enrich_tried"] = True
             await enrich_token(client, mint)
-            await asyncio.sleep(1.1)
-        for mint in to_rugcheck[:3]:
+            await asyncio.sleep(0.5)
+        for mint in to_rugcheck[:10]:
             tokens[mint]["rugcheck_tried"] = True
             await rugcheck_token(client, mint)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
 
 def calc_bonding_curve_pnl(sig: dict, token_data: dict) -> float | None:
@@ -466,7 +467,14 @@ async def ml_scanner(client: httpx.AsyncClient):
             token["volume_rate"] = buy_sol_total / max(1, age)
             token["buyer_rate"] = len(unique_buyers_set) / max(1, age)
             total_trades = buys + sells
-            raw_mom = ((p30 / p15) - 1) * 100 if p15 > 0 and p30 > 0 else 0.0
+            price_hist = tc.get("price_history", [])
+            created_ts = token["created_ts"]
+            mid_ts = created_ts + age / 2
+            ph_first = [p for ts, p in price_hist if ts <= mid_ts and p > 0]
+            ph_second = [p for ts, p in price_hist if ts > mid_ts and p > 0]
+            p_first_med = float(np.median(ph_first)) if ph_first else 0
+            p_second_med = float(np.median(ph_second)) if ph_second else 0
+            raw_mom = ((p_second_med / p_first_med) - 1) * 100 if p_first_med > 0 and p_second_med > 0 else 0.0
             token["momentum_15_30"] = max(-500.0, min(500.0, raw_mom))
             token["total_buys"] = buys
             token["total_sells"] = sells
@@ -570,19 +578,26 @@ async def ml_scanner(client: httpx.AsyncClient):
             sniper_sol = sum(buyer_amts.get(addr, 0) for addr in early_buyers_set)
             token["early_buyer_sol_pct"] = min(sniper_sol / max(0.01, buy_sol_total) * 100, 100.0)
 
-            buys_first_half = sum(1 for a, amt in buyer_amts.items() if amt > 0) // 2
-            token["buy_acceleration"] = min(max(1, buys - buys_first_half) / max(1, buys_first_half), 10.0) if buys > 1 else 1.0
+            buy_ts_list = tc.get("buy_timestamps", [])
+            buys_first_half = sum(1 for ts in buy_ts_list if ts <= mid_ts)
+            buys_second_half = len(buy_ts_list) - buys_first_half
+            token["buy_acceleration"] = min(buys_second_half / max(1, buys_first_half), 10.0)
 
-            token["sell_delay_norm"] = 1.0
+            first_sell_ts = tc.get("first_sell_ts", 0)
+            if first_sell_ts > 0:
+                token["sell_delay_norm"] = min((first_sell_ts - created_ts) / max(1, age), 1.0)
+            else:
+                token["sell_delay_norm"] = 1.0
 
-            init_price = token.get("initial_price_usd", 0)
-            if init_price > 0 and cur_price > 0:
-                price_ratio = cur_price / init_price
-                token["price_volatility"] = min(abs(price_ratio - 1.0), 10.0)
+            price_vals = [p for _, p in price_hist if p > 0]
+            if len(price_vals) >= 2:
+                pv_mean = np.mean(price_vals)
+                pv_std = np.std(price_vals)
+                token["price_volatility"] = min(pv_std / max(1e-12, pv_mean), 10.0)
             else:
                 token["price_volatility"] = 0.0
 
-            token["consecutive_buys_max"] = float(min(buys, buys - sells + 1)) if buys > sells else 1.0
+            token["consecutive_buys_max"] = float(tc.get("consecutive_buys_max", 0))
 
             if len(buyer_amts) >= 2:
                 ba_vals = list(buyer_amts.values())
@@ -594,11 +609,7 @@ async def ml_scanner(client: httpx.AsyncClient):
 
             token["net_flow_rate"] = max(-100.0, min(100.0, net_sol / max(1, age)))
 
-            peak_price_usd = max(cur_price, init_price) if init_price > 0 else cur_price
-            for snap_key in ("price_snap_15s", "price_snap_30s", "price_snap_60s", "price_snap_120s", "price_snap_240s"):
-                sp = token.get(snap_key, 0)
-                if sp > peak_price_usd:
-                    peak_price_usd = sp
+            peak_price_usd = max(price_vals) if price_vals else cur_price
             token["price_drawdown"] = max(0.0, min(100.0, (peak_price_usd - cur_price) / max(1e-12, peak_price_usd) * 100)) if peak_price_usd > 0 else 0.0
 
             label, confidence = predict_token(token)
@@ -1076,6 +1087,11 @@ async def listen_pumpportal():
                         "early_buyers": set(),
                         "buyer_amounts": {},
                         "seller_amounts": {},
+                        "buy_timestamps": [],
+                        "first_sell_ts": 0,
+                        "consecutive_buys_cur": 0,
+                        "consecutive_buys_max": 0,
+                        "price_history": [],
                     }
                     stats["total"] += 1
 
@@ -1103,6 +1119,11 @@ async def listen_pumpportal():
                     if tx == "buy":
                         tc["buys"] += 1
                         tc["buy_sol"] += sol_amount
+                        tc.setdefault("buy_timestamps", []).append(time.time())
+                        cur_streak = tc.get("consecutive_buys_cur", 0) + 1
+                        tc["consecutive_buys_cur"] = cur_streak
+                        if cur_streak > tc.get("consecutive_buys_max", 0):
+                            tc["consecutive_buys_max"] = cur_streak
                         if sol_amount > tc.get("max_buy_sol", 0):
                             tc["max_buy_sol"] = sol_amount
                         if trader_key:
@@ -1115,6 +1136,9 @@ async def listen_pumpportal():
                     else:
                         tc["sells"] += 1
                         tc["sell_sol"] += sol_amount
+                        tc["consecutive_buys_cur"] = 0
+                        if tc.get("first_sell_ts", 0) == 0:
+                            tc["first_sell_ts"] = time.time()
                         if trader_key:
                             tc["sellers"].add(trader_key)
                             tc["seller_amounts"][trader_key] = tc["seller_amounts"].get(trader_key, 0) + sol_amount
@@ -1138,6 +1162,7 @@ async def listen_pumpportal():
                                 key = f"price_snap_{snap_s}s"
                                 if token_age >= snap_s and tokens[mint].get(key, 0.0) == 0.0:
                                     tokens[mint][key] = cur_price
+                            tc.setdefault("price_history", []).append((time.time(), cur_price))
 
                     for sig in signals:
                         if sig["mint"] == mint and sig["status"] == "ACTIVE":
@@ -1727,6 +1752,8 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
     batch_state["checking_progress"] = 0
     batch_state["checking_samples"] = 0
 
+    _processing_mints.update(bt["mint"] for bt in batch_tokens.values())
+
     samples = []
     rockets_found = 0
     predicted_rockets = 0
@@ -1833,7 +1860,7 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
                         "features": noisy.tolist(),
                         "label": s["label"],
                         "hard_label": s["hard_label"],
-                        "weight": s["weight"] * 0.8,
+                        "weight": s["weight"] * 0.9,
                         "pnl": s["pnl"],
                     })
         all_samples.extend(augmented)
@@ -1866,8 +1893,8 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
             rocket_sum = w[rocket_mask].sum()
             trash_sum = w[trash_mask].sum()
             target = (rocket_sum + trash_sum) / 2
-            w[rocket_mask] *= target / rocket_sum
-            w[trash_mask] *= target / trash_sum
+            w[rocket_mask] *= target / rocket_sum * 1.2
+            w[trash_mask] *= target / trash_sum * 0.8
 
         X_n = (X - entry_mean) / entry_std
 
@@ -1923,8 +1950,8 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         model_info["total_samples"] += fed_count
         model_info["total_wins"] += wins
         model_info["last_train_ts"] = time.time()
-        model_info["rockets_found"] += predicted_rockets
-        model_info["rockets_missed"] += rockets_found
+        model_info["rockets_found"] += correct_rockets
+        model_info["rockets_missed"] += (rockets_found - correct_rockets)
 
         entry_path = os.path.join(DATA_DIR, "entry_model.pt")
         torch.save({
@@ -2122,6 +2149,7 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
         label_3h_state["earliest_ready_ts"] = min(item["eval_ts"] for item in pending_3h_queue) + LABEL_3H_DELAY
     log.info("3H QUEUE: %d tokens pending re-evaluation", len(pending_3h_queue))
 
+    _processing_mints.clear()
     batch_state["checking_id"] = 0
     batch_state["checking_progress"] = 0
     batch_state["checking_total"] = 0
@@ -2394,12 +2422,17 @@ async def memory_cleanup():
         await asyncio.sleep(MEMORY_CLEANUP_INTERVAL)
         now = time.time()
         signal_mints = {s["mint"] for s in signals if s["status"] == "ACTIVE"}
-        batch_mints = set(current_batch_tokens.keys())
+        batch_mints = set()
+        for k in current_batch_tokens:
+            batch_mints.add(k.rsplit("_cp", 1)[0])
         for pb in pending_batches:
-            batch_mints.update(pb["tokens"].keys())
+            for k in pb["tokens"]:
+                batch_mints.add(k.rsplit("_cp", 1)[0])
+        pending_3h_mints = {item["mint"] for item in pending_3h_queue}
+        protected = signal_mints | batch_mints | _processing_mints | pending_3h_mints
         stale = []
         for mint, t in tokens.items():
-            if mint in signal_mints or mint in batch_mints:
+            if mint in protected:
                 continue
             last_trade = t.get("last_trade_time", t.get("created_ts", 0))
             if now - last_trade > TOKEN_MAX_AGE:
@@ -2408,7 +2441,7 @@ async def memory_cleanup():
             del tokens[mint]
             trade_counts.pop(mint, None)
         if stale:
-            log.info("MEMORY CLEANUP: removed %d stale tokens, %d remain", len(stale), len(tokens))
+            log.info("MEMORY CLEANUP: removed %d stale tokens, %d remain (protected=%d)", len(stale), len(tokens), len(protected))
 
 
 AUTOSAVE_INTERVAL = 3600
