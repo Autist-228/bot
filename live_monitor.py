@@ -655,7 +655,7 @@ async def ml_scanner(client: httpx.AsyncClient):
                     continue
 
                 liq = token.get("dex_liquidity_usd", 0)
-                if liq < MIN_LIQUIDITY_USD and token.get("enriched"):
+                if liq < MIN_LIQUIDITY_USD and token.get("migrated"):
                     log.info(
                         "SKIP %s %s: liquidity=$%.0f < $%.0f",
                         label, token["symbol"], liq, MIN_LIQUIDITY_USD,
