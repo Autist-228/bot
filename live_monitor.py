@@ -326,6 +326,9 @@ async def enrich_token(client: httpx.AsyncClient, mint: str):
             return
         pairs = r.json()
         if not pairs or not isinstance(pairs, list) or len(pairs) == 0:
+            token = tokens.get(mint)
+            if token:
+                token["enriched"] = True
             return
         p = pairs[0]
         token = tokens[mint]
@@ -439,6 +442,13 @@ async def ml_scanner(client: httpx.AsyncClient):
                     break
             if checkpoint_hit is None:
                 continue
+
+            if not token.get("enriched") and not token.get("enrich_tried") and age >= 30:
+                token["enrich_tried"] = True
+                await enrich_token(client, mint)
+            if not token.get("rugcheck_done") and not token.get("rugcheck_tried") and age >= 15:
+                token["rugcheck_tried"] = True
+                await rugcheck_token(client, mint)
 
             tc = trade_counts.get(mint, {})
             buys = tc.get("buys", 0)
