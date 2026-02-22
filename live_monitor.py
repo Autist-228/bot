@@ -1020,17 +1020,42 @@ async def signal_price_updater():
                     log.debug("Price update error for %s: %s", sig.get("symbol", "?"), exc)
 
 
+_ws_last_msg_time: float = 0.0
+
+
+async def _ws_watchdog():
+    global _ws_last_msg_time
+    while True:
+        await asyncio.sleep(60)
+        if _ws_last_msg_time > 0:
+            silence = time.time() - _ws_last_msg_time
+            if silence > 120:
+                log.warning("WS WATCHDOG: no messages for %.0fs, forcing reconnect", silence)
+                for task in asyncio.all_tasks():
+                    if task.get_name() == "listen_pumpportal":
+                        task.cancel()
+                        break
+
+
 async def listen_pumpportal():
+    global _ws_last_msg_time
     ws = None
     while True:
         try:
-            ws = await websockets.connect(PUMPPORTAL_WS_URL)
+            ws = await websockets.connect(
+                PUMPPORTAL_WS_URL,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=10,
+            )
             log.info("Connected to PumpPortal WebSocket")
             telegram_state["ws_connected"] = True
+            _ws_last_msg_time = time.time()
             await ws.send(json.dumps({"method": "subscribeNewToken"}))
             log.info("Subscribed to newToken events")
 
             async for raw in ws:
+                _ws_last_msg_time = time.time()
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
@@ -1198,14 +1223,14 @@ async def listen_pumpportal():
 
                     stats["trades"] += 1
 
-        except websockets.exceptions.ConnectionClosed:
+        except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
             telegram_state["ws_connected"] = False
             log.warning("Disconnected, reconnecting in 3s...")
             log_error("WebSocket отключился")
             await asyncio.sleep(3)
         except Exception as e:
             telegram_state["ws_connected"] = False
-            log.error("Error: %s, reconnecting in 5s...", e)
+            log.error("WS Error: %s, reconnecting in 5s...", e)
             log_error(f"WebSocket ошибка: {e}")
             await asyncio.sleep(5)
         finally:
@@ -2045,6 +2070,12 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
             exit_std[exit_std < 1e-6] = 1.0
             exit_optimizer = torch.optim.Adam(exit_model.parameters(), lr=INITIAL_LR, weight_decay=1e-4)
             log.info("EXIT MODEL created fresh: %d features (15 entry + 1 conf + 2 ns1_stats + 5 position)", n_exit_features)
+        else:
+            new_mean = eX.mean(axis=0)
+            new_std = eX.std(axis=0)
+            new_std[new_std < 1e-6] = 1.0
+            exit_mean = 0.9 * exit_mean + 0.1 * new_mean
+            exit_std = 0.9 * exit_std + 0.1 * new_std
 
         eX_n = (eX - exit_mean) / exit_std
         eX_t = torch.from_numpy(eX_n)
@@ -2087,12 +2118,6 @@ async def _process_batch(batch_id: int, batch_tokens: dict):
                 break
         exit_model.eval()
         exit_loss_val = e_best_loss
-
-        new_mean = eX.mean(axis=0)
-        new_std = eX.std(axis=0)
-        new_std[new_std < 1e-6] = 1.0
-        exit_mean = 0.9 * exit_mean + 0.1 * new_mean
-        exit_std = 0.9 * exit_std + 0.1 * new_std
 
         exit_model_info["cycles"] += 1
         exit_model_info["loss"] = exit_loss_val
@@ -2521,7 +2546,8 @@ async def main():
     async with httpx.AsyncClient() as client:
         await fetch_sol_price(client)
 
-        listener = asyncio.create_task(listen_pumpportal())
+        listener = asyncio.create_task(listen_pumpportal(), name="listen_pumpportal")
+        watchdog = asyncio.create_task(_ws_watchdog())
         scanner = asyncio.create_task(ml_scanner(client))
         price_updater = asyncio.create_task(signal_price_updater())
         enricher = asyncio.create_task(enrich_batch(client))
@@ -2558,6 +2584,7 @@ async def main():
             "Signal collection ended. Tracking active positions for 2 more minutes..."
         )
         listener.cancel()
+        watchdog.cancel()
         scanner.cancel()
         enricher.cancel()
         batch_proc.cancel()
