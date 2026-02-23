@@ -3,6 +3,9 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
 PUMPPORTAL_WS_URL = "wss://pumpportal.fun/api/data"
 
 BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "1.0"))
