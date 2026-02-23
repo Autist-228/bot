@@ -22,7 +22,7 @@ log = logging.getLogger("telegram")
 
 
 def _fmt_usd(v: float) -> str:
-    return f"{v:+.2f}" if v >= 0 else f"{v:.2f}"
+    return f"{v:+.2f}"
 
 
 def _build_main_screen(bot: Sniper) -> str:
@@ -52,7 +52,7 @@ def _build_main_screen(bot: Sniper) -> str:
         f"{status_emoji} *MAXIMUM SNIPER* {'`RUNNING`' if bot._running else '`STOPPED`'}",
         "",
         f"{bal_emoji} *Paper Balance:* `${bot.paper_balance:.2f}`",
-        f"{chart_emoji} *PnL:* `${_fmt_usd(bot.total_pnl)}` ({_fmt_usd(bot.total_pnl / STARTING_BALANCE * 100)}%)",
+        f"{chart_emoji} *PnL:* `${_fmt_usd(bot.total_pnl)}` ({_fmt_usd(bot.total_pnl / max(STARTING_BALANCE, 0.01) * 100)}%)",
         "",
         f"{trades_emoji} *Trades:* {bot.total_trades} (W:{bot.total_wins} / L:{bot.total_trades - bot.total_wins})",
         f"{fire_emoji} *Win Rate:* {wr:.1f}%",
@@ -178,8 +178,9 @@ async def _auto_update(context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id, text, parse_mode="Markdown", reply_markup=kb,
             )
             context.bot_data["main_msg_id"] = msg.message_id
-    except Exception:
-        pass
+    except Exception as exc:
+        if "message is not modified" not in str(exc):
+            log.warning("Auto-update failed: %s", exc)
 
 
 async def _post_init(app: Application) -> None:
