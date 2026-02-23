@@ -11,3 +11,4 @@ env/
 dist/
 build/
 .eggs/
+data/
