@@ -3,24 +3,33 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-CODEX_API_KEY = os.getenv("CODEX_API_KEY", "")
-TWITTER_API_KEY = os.getenv("TWITTER_API_KEY", "")
-HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
+HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL", "")
 
-CODEX_GRAPHQL_URL = "https://graph.codex.io/graphql"
-TWITTER_API_BASE = "https://api.twitterapi.io"
+PUMPPORTAL_WS_URL = "wss://pumpportal.fun/api/data"
+DEXSCREENER_API = "https://api.dexscreener.com"
 
-SOLANA_NETWORK_ID = 1399811149
+COLLECT_DURATION = int(os.getenv("COLLECT_DURATION", "1800"))
+COOLDOWN_DURATION = int(os.getenv("COOLDOWN_DURATION", "900"))
 
-SIGNAL_THRESHOLD = 3
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-SCAN_INTERVAL_SECONDS = 60
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "1500"))
+BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "3.0"))
+MAX_SLOTS = int(os.getenv("MAX_SLOTS", "10"))
 
-MIN_LIQUIDITY_USD = 5000
-MIN_VOLUME_24H_USD = 10000
-MAX_TOP_HOLDER_PERCENT = 20.0
-MIN_BUY_COUNT_5M = 3
-MAX_TOKEN_AGE_HOURS = 48
+PUMPFUN_FEE_PCT = 0.01
+BUY_SLIPPAGE_PCT = 0.02
+SELL_SLIPPAGE_PCT = 0.03
+
+STOP_LOSS_PCT = -15.0
+TRAILING_STOP_PCT = 15.0
+TIME_STOP_SEC = 60
+TIME_STOP_MIN_GAIN = 10.0
+
+MIN_CONFIDENCE_PCT = 70.0
+MIN_BUY_RATIO = 1.5
+ROCKET_ONLY = True
+
+PRICE_SNAPSHOT_INTERVALS = [15, 30, 60, 120, 300, 600, 900]
