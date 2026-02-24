@@ -223,6 +223,7 @@ class Sniper:
         fee_usd = self._tx_fee_usd()
         self.paper_balance -= fee_usd
         self.total_fees += fee_usd
+        fee_usd_total = fee_usd
 
         pos.pnl_usd = pnl_usd
 
@@ -248,7 +249,7 @@ class Sniper:
             "hold_sec": round(age, 1),
             "pnl_pct": round(pnl_pct, 2),
             "pnl_usd": round(pnl_usd, 4),
-            "fee_usd": round(fee_usd * 2, 4),
+            "fee_usd": round(fee_usd_total, 4),
             "peak_pct": round(pos.peak_pnl_pct, 2),
             "reason": reason,
             "buyers": len(pos.unique_buyers),
@@ -266,7 +267,7 @@ class Sniper:
             reason,
             pnl_pct,
             pnl_usd,
-            fee_usd * 2,
+            fee_usd_total,
             pos.peak_pnl_pct,
             int(age),
             len(pos.unique_buyers),
@@ -306,8 +307,7 @@ class Sniper:
         if self._open_count() >= MAX_CONCURRENT:
             return
 
-        fee_usd = self._tx_fee_usd()
-        if self._available_balance() < BET_SIZE_USD + fee_usd:
+        if self._available_balance() < BET_SIZE_USD:
             return
 
         curve = self.token_curves.get(mint)
@@ -321,9 +321,6 @@ class Sniper:
         tokens_bought, sol_spent = self._simulate_buy(v_sol, v_tokens, BET_SIZE_USD)
         if tokens_bought <= 0:
             return
-
-        self.paper_balance -= fee_usd
-        self.total_fees += fee_usd
 
         pos = Position(
             mint=mint,
@@ -343,12 +340,11 @@ class Sniper:
         self.reserved += BET_SIZE_USD
         self.tokens_passed_p2 += 1
         log.info(
-            "BUY  %s | buyers=%d | v_sol=%.1f | $%.2f bet | fee=$%.4f | open=%d",
+            "BUY  %s | buyers=%d | v_sol=%.1f | $%.2f bet | open=%d",
             pos.symbol[:10],
             len(wt.unique_buyers),
             v_sol,
             BET_SIZE_USD,
-            fee_usd,
             self._open_count(),
         )
 
