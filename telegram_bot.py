@@ -29,38 +29,44 @@ def _build_main_screen(bot: Sniper) -> str:
     uptime = time.time() - bot.start_time
     hrs = uptime / 3600
     wr = (bot.total_wins / bot.total_trades * 100) if bot.total_trades > 0 else 0.0
-    per_day = (bot.total_pnl / hrs * 24) if hrs > 0.01 else 0.0
+    net_pnl = bot.total_pnl - bot.total_fees
+    per_day = (net_pnl / hrs * 24) if hrs > 0.01 else 0.0
     open_pos = bot._open_count()
-    pending = sum(1 for p in bot.positions.values() if p.phase == "pending")
-    confirmed = sum(1 for p in bot.positions.values() if p.phase == "confirmed")
+    watching = bot._watching_count()
 
     status_emoji = "\U0001f7e2" if bot._running else "\U0001f534"
     bal_emoji = "\U0001f4b0"
-    chart_emoji = "\U0001f4c8" if bot.total_pnl >= 0 else "\U0001f4c9"
+    chart_emoji = "\U0001f4c8" if net_pnl >= 0 else "\U0001f4c9"
     trades_emoji = "\U0001f3af"
     clock_emoji = "\u23f0"
     fire_emoji = "\U0001f525"
     folder_emoji = "\U0001f4c2"
     shield_emoji = "\U0001f6e1"
+    fee_emoji = "\U0001f4b8"
+    eye_emoji = "\U0001f440"
 
     if hrs < 1:
         uptime_str = f"{int(uptime // 60)}m"
     else:
         uptime_str = f"{hrs:.1f}h"
 
+    pnl_pct = net_pnl / max(STARTING_BALANCE, 0.01) * 100
+
     lines = [
-        f"{status_emoji} *MAXIMUM SNIPER* {'`RUNNING`' if bot._running else '`STOPPED`'}",
+        f"{status_emoji} *MAXIMUM SNIPER v2* {'`RUNNING`' if bot._running else '`STOPPED`'}",
         "",
-        f"{bal_emoji} *Paper Balance:* `${bot.paper_balance:.2f}`",
-        f"{chart_emoji} *PnL:* `${_fmt_usd(bot.total_pnl)}` ({_fmt_usd(bot.total_pnl / max(STARTING_BALANCE, 0.01) * 100)}%)",
+        f"{bal_emoji} *Balance:* `${bot.paper_balance:.2f}`",
+        f"{chart_emoji} *Net PnL:* `${_fmt_usd(net_pnl)}` ({_fmt_usd(pnl_pct)}%)",
+        f"{fee_emoji} *Fees paid:* `${bot.total_fees:.2f}`",
         "",
         f"{trades_emoji} *Trades:* {bot.total_trades} (W:{bot.total_wins} / L:{bot.total_trades - bot.total_wins})",
         f"{fire_emoji} *Win Rate:* {wr:.1f}%",
         f"{chart_emoji} *$/day:* `${per_day:.2f}`",
         "",
-        f"{folder_emoji} *Open:* {open_pos} (P:{pending} C:{confirmed})",
+        f"{folder_emoji} *Open:* {open_pos} | {eye_emoji} *Watching:* {watching}",
         f"{shield_emoji} *Bet:* ${BET_SIZE_USD:.2f} | *Blacklist:* {len(bot.dev_blacklist)}",
         f"{clock_emoji} *Uptime:* {uptime_str} | *Seen:* {bot.tokens_seen}",
+        f"P1: {bot.tokens_passed_p1} | P2: {bot.tokens_passed_p2} | P2fail: {bot.tokens_p2_failed}",
     ]
 
     if bot.total_trades > 0:
@@ -68,7 +74,7 @@ def _build_main_screen(bot: Sniper) -> str:
         lines.append(f"\U0001f3c6 *Best:* `${bot.best_trade:+.4f}` | *Worst:* `${bot.worst_trade:.4f}`")
 
     lines.append("")
-    lines.append("\u26a0\ufe0f _Paper trading mode_")
+    lines.append("\u26a0\ufe0f _Paper trading (real fees + slippage)_")
 
     return "\n".join(lines)
 
