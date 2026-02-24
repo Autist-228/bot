@@ -221,7 +221,7 @@ class Sniper:
             return f"DEAD({idle:.0f}s)"
         if age < EPOCH_T0_END:
             trail = EPOCH_T0_TRAIL
-            if pos.peak_pnl_pct < EPOCH_T0_RUG_PEAK and pnl_pct < 0:
+            if age >= 5 and pos.peak_pnl_pct < EPOCH_T0_RUG_PEAK and pnl_pct < 0:
                 return f"RUG_T0(peak={pos.peak_pnl_pct:.0f}%)"
         elif age < EPOCH_T1_END:
             trail = EPOCH_T1_TRAIL
