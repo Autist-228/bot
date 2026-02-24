@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Maximum Sniper Bot v2 — realistic paper trading mode.
+Maximum Sniper Bot v3 — Spray & Dynamic Exit.
 
-Watches pump.fun tokens at CREATION, buys ONLY after Phase 2 confirmation.
-Includes real Solana transaction fees and extra slippage in simulation.
+Light entry filter (Phase 1 + Phase 2 with 3 buyers / 3s wait),
+epoch-based dynamic trailing stops, dead-token & dev-sell detection.
 """
 
 from __future__ import annotations
@@ -25,25 +25,32 @@ from config import (
     BLACKLIST_PATH,
     BUY_SLIPPAGE_PCT,
     DATA_DIR,
+    DEAD_TOKEN_SEC,
     DEV_MAX_BUY_SOL,
     DEV_MIN_BUY_SOL,
     EMERGENCY_STOP_PCT,
+    EPOCH_T0_END,
+    EPOCH_T0_RUG_PEAK,
+    EPOCH_T0_TRAIL,
+    EPOCH_T1_END,
+    EPOCH_T1_STALL_PEAK,
+    EPOCH_T1_TRAIL,
+    EPOCH_T2_END,
+    EPOCH_T2_TRAIL,
+    EPOCH_T3_END,
+    EPOCH_T3_TRAIL,
     EXTRA_BUY_SLIPPAGE_PCT,
     EXTRA_SELL_SLIPPAGE_PCT,
     MAX_CONCURRENT,
     PHASE2_MIN_BUYERS,
     PHASE2_WAIT_SEC,
     PUMPFUN_FEE_PCT,
-    RUG_CHECK_SEC,
-    RUG_MIN_PEAK_PCT,
     PUMPPORTAL_WS_URL,
     SELL_SLIPPAGE_PCT,
     SOL_TX_FEE_PER_TRADE,
     STARTING_BALANCE,
     STATE_PATH,
-    TIME_STOP_SEC,
     TRADES_LOG_PATH,
-    TRAILING_STOP_PCT,
 )
 
 log = logging.getLogger("sniper")
@@ -207,14 +214,31 @@ class Sniper:
         age = time.time() - pos.entry_time
         if pnl_pct <= EMERGENCY_STOP_PCT:
             return "EMERGENCY"
-        if age >= RUG_CHECK_SEC and pos.peak_pnl_pct < RUG_MIN_PEAK_PCT and pnl_pct < 0:
-            return f"RUG_EXIT(peak={pos.peak_pnl_pct:.0f}%)"
+        if pos.dev_sold:
+            return "DEV_SELL"
+        idle = time.time() - pos.last_trade_time if pos.last_trade_time > 0 else 0
+        if idle >= DEAD_TOKEN_SEC and pnl_pct < 5.0:
+            return f"DEAD({idle:.0f}s)"
+        if age < EPOCH_T0_END:
+            trail = EPOCH_T0_TRAIL
+            if pos.peak_pnl_pct < EPOCH_T0_RUG_PEAK and pnl_pct < 0:
+                return f"RUG_T0(peak={pos.peak_pnl_pct:.0f}%)"
+        elif age < EPOCH_T1_END:
+            trail = EPOCH_T1_TRAIL
+            if pos.peak_pnl_pct < EPOCH_T1_STALL_PEAK and pnl_pct < 0:
+                return f"STALL_T1(peak={pos.peak_pnl_pct:.0f}%)"
+        elif age < EPOCH_T2_END:
+            trail = EPOCH_T2_TRAIL
+        elif age < EPOCH_T3_END:
+            trail = EPOCH_T3_TRAIL
+        else:
+            trail = EPOCH_T3_TRAIL
+            if pnl_pct < 5.0:
+                return f"TIME_T4({age:.0f}s)"
         if pos.peak_pnl_pct > 5.0:
             drop = pos.peak_pnl_pct - pnl_pct
-            if drop >= TRAILING_STOP_PCT:
-                return f"TRAILING(peak={pos.peak_pnl_pct:.0f}%)"
-        if age >= TIME_STOP_SEC and pnl_pct < 5.0:
-            return f"TIME({age:.0f}s)"
+            if drop >= trail:
+                return f"TRAIL(peak={pos.peak_pnl_pct:.0f}%,epoch={age:.0f}s)"
         return None
 
     def _close_position(self, pos: Position, reason: str, pnl_pct: float) -> None:
@@ -574,27 +598,26 @@ class Sniper:
 
     async def run(self) -> None:
         log.info(
-            "Maximum Sniper v2 starting | balance=$%.2f | bet=$%.2f | max_concurrent=%d",
+            "Sniper v3 Spray&DynExit | bal=$%.2f | bet=$%.2f | max=%d",
             self.paper_balance,
             BET_SIZE_USD,
             MAX_CONCURRENT,
         )
         log.info(
-            "Phase1: dev_buy=%.2f-%.1f SOL | Phase2: %ds, %d+ buyers (BUY ONLY AFTER P2)",
+            "P1: dev %.2f-%.1f SOL | P2: %ds %d+ buyers",
             DEV_MIN_BUY_SOL,
             DEV_MAX_BUY_SOL,
             PHASE2_WAIT_SEC,
             PHASE2_MIN_BUYERS,
         )
         log.info(
-            "Exit: trailing=%g%%, time=%ds, emergency=%g%% | "
-            "Extra slippage: buy=%g%%, sell=%g%% | TX fee=%.6f SOL",
-            TRAILING_STOP_PCT,
-            TIME_STOP_SEC,
+            "Epochs T0<%ds trail=%g%% | T1<%ds trail=%g%% | T2<%ds trail=%g%% | T3<%ds trail=%g%% | dead=%ds | emrg=%g%%",
+            EPOCH_T0_END, EPOCH_T0_TRAIL,
+            EPOCH_T1_END, EPOCH_T1_TRAIL,
+            EPOCH_T2_END, EPOCH_T2_TRAIL,
+            EPOCH_T3_END, EPOCH_T3_TRAIL,
+            DEAD_TOKEN_SEC,
             EMERGENCY_STOP_PCT,
-            EXTRA_BUY_SLIPPAGE_PCT * 100,
-            EXTRA_SELL_SLIPPAGE_PCT * 100,
-            SOL_TX_FEE_PER_TRADE,
         )
 
         loop = asyncio.get_running_loop()
@@ -626,6 +649,11 @@ class Sniper:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     bot = Sniper()
     asyncio.run(bot.run())
 
