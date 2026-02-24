@@ -367,13 +367,18 @@ class Sniper:
         self.positions[mint] = pos
         self.reserved += BET_SIZE_USD
         self.tokens_passed_p2 += 1
+        init_pnl = self._calc_pnl_pct(pos)
+        pos.peak_pnl_pct = init_pnl
+        pos.current_pnl_pct = init_pnl
+        pos.last_trade_time = time.time()
         log.info(
-            "BUY  %s | buyers=%d | v_sol=%.1f | $%.2f bet | open=%d",
+            "BUY  %s | buyers=%d | v_sol=%.1f | $%.2f bet | open=%d | init_pnl=%.1f%%",
             pos.symbol[:10],
             len(wt.unique_buyers),
             v_sol,
             BET_SIZE_USD,
             self._open_count(),
+            init_pnl,
         )
 
     def _handle_trade(self, msg: dict) -> None:
