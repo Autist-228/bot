@@ -34,6 +34,8 @@ from config import (
     PHASE2_MIN_BUYERS,
     PHASE2_WAIT_SEC,
     PUMPFUN_FEE_PCT,
+    RUG_CHECK_SEC,
+    RUG_MIN_PEAK_PCT,
     PUMPPORTAL_WS_URL,
     SELL_SLIPPAGE_PCT,
     SOL_TX_FEE_PER_TRADE,
@@ -205,6 +207,8 @@ class Sniper:
         age = time.time() - pos.entry_time
         if pnl_pct <= EMERGENCY_STOP_PCT:
             return "EMERGENCY"
+        if age >= RUG_CHECK_SEC and pos.peak_pnl_pct < RUG_MIN_PEAK_PCT and pnl_pct < 0:
+            return f"RUG_EXIT(peak={pos.peak_pnl_pct:.0f}%)"
         if pos.peak_pnl_pct > 5.0:
             drop = pos.peak_pnl_pct - pnl_pct
             if drop >= TRAILING_STOP_PCT:

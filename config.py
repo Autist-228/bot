@@ -8,19 +8,32 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 PUMPPORTAL_WS_URL = "wss://pumpportal.fun/api/data"
 
-BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "3.0"))
-STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "30.0"))
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "50"))
+BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "1.0"))
+STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "50.0"))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "10"))
 
 DEV_MIN_BUY_SOL = float(os.getenv("DEV_MIN_BUY_SOL", "0.05"))
 DEV_MAX_BUY_SOL = float(os.getenv("DEV_MAX_BUY_SOL", "10.0"))
 
-PHASE2_WAIT_SEC = int(os.getenv("PHASE2_WAIT_SEC", "5"))
-PHASE2_MIN_BUYERS = int(os.getenv("PHASE2_MIN_BUYERS", "10"))
+PHASE2_WAIT_SEC = int(os.getenv("PHASE2_WAIT_SEC", "3"))
+PHASE2_MIN_BUYERS = int(os.getenv("PHASE2_MIN_BUYERS", "3"))
 
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "15.0"))
-TIME_STOP_SEC = int(os.getenv("TIME_STOP_SEC", "300"))
-EMERGENCY_STOP_PCT = float(os.getenv("EMERGENCY_STOP_PCT", "-50.0"))
+EMERGENCY_STOP_PCT = float(os.getenv("EMERGENCY_STOP_PCT", "-35.0"))
+
+EPOCH_T0_END = int(os.getenv("EPOCH_T0_END", "10"))
+EPOCH_T1_END = int(os.getenv("EPOCH_T1_END", "30"))
+EPOCH_T2_END = int(os.getenv("EPOCH_T2_END", "120"))
+EPOCH_T3_END = int(os.getenv("EPOCH_T3_END", "600"))
+
+EPOCH_T0_TRAIL = float(os.getenv("EPOCH_T0_TRAIL", "30.0"))
+EPOCH_T1_TRAIL = float(os.getenv("EPOCH_T1_TRAIL", "20.0"))
+EPOCH_T2_TRAIL = float(os.getenv("EPOCH_T2_TRAIL", "15.0"))
+EPOCH_T3_TRAIL = float(os.getenv("EPOCH_T3_TRAIL", "20.0"))
+
+EPOCH_T0_RUG_PEAK = float(os.getenv("EPOCH_T0_RUG_PEAK", "3.0"))
+EPOCH_T1_STALL_PEAK = float(os.getenv("EPOCH_T1_STALL_PEAK", "10.0"))
+
+DEAD_TOKEN_SEC = int(os.getenv("DEAD_TOKEN_SEC", "15"))
 
 PUMPFUN_FEE_PCT = 0.01
 BUY_SLIPPAGE_PCT = 0.01
